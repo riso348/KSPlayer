@@ -259,7 +259,12 @@ class AudioSwresample: FrameChange {
         // 返回值是有乘以声道，所以不用返回值
         _ = av_samples_get_buffer_size(&bufferSize, channels, outSamples, descriptor.audioFormat.sampleFormat, 1)
         let frame = AudioFrame(dataSize: Int(bufferSize[0]), audioFormat: descriptor.audioFormat)
-        frame.numberOfSamples = UInt32(swr_convert(swrContext, &frame.data, outSamples, &frameBuffer, numberOfSamples))
+        // `swr_convert` returns a negative FFmpeg error code (EINVAL,
+        // ENOMEM, …) when resample fails — the previous `UInt32(...)`
+        // cast trapped on negative values, killing the player instead
+        // of falling back to silence + logging the error.
+        let converted = swr_convert(swrContext, &frame.data, outSamples, &frameBuffer, numberOfSamples)
+        frame.numberOfSamples = converted >= 0 ? UInt32(converted) : 0
         return frame
     }
 

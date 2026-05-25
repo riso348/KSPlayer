@@ -122,7 +122,14 @@ class MEFilter {
         params.width = inputFrame.pointee.width
         params.height = inputFrame.pointee.height
         params.sample_aspect_ratio = inputFrame.pointee.sample_aspect_ratio
-        params.frame_rate = AVRational(num: 1, den: Int32(nominalFrameRate))
+        // Guard against NaN/Inf — `FFmpegAssetTrack` derives nominalFrameRate
+        // by dividing nb_frames / duration. When duration is 0 (broken or
+        // partial container metadata) the result is NaN/Inf, and the plain
+        // `Int32(Float)` cast traps with "Float value cannot be converted
+        // to Int32 because it is either infinite or NaN", killing the
+        // player on the first frame of those streams. Fall back to 24 fps.
+        let safeFrameRate: Float = nominalFrameRate.isFinite && nominalFrameRate > 0 ? nominalFrameRate : 24
+        params.frame_rate = AVRational(num: 1, den: Int32(safeFrameRate))
         if let ctx = inputFrame.pointee.hw_frames_ctx {
             params.hw_frames_ctx = av_buffer_ref(ctx)
         }
