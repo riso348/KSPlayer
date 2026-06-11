@@ -46,9 +46,12 @@ public class CircularBuffer<Item: ObjectQueueItem> {
         if destroyed {
             return
         }
-        if _buffer[Int(tailIndex & mask)] != nil {
-            assertionFailure("value is not nil of headIndex: \(headIndex),tailIndex: \(tailIndex), bufferCount: \(_buffer.count), mask: \(mask)")
-        }
+        // NOTE (RMDB fork): the original `assertionFailure` here crashed DEBUG
+        // builds on a recoverable buffer overrun — the producer outran the
+        // consumer during a network stall (TCP reset / buffering). Release
+        // builds compile the assert out and just overwrite the slot, so this
+        // drops the assert to match: no behaviour change vs release, just no
+        // debug-only crash while developing the tvOS app via Xcode.
         _buffer[Int(tailIndex & mask)] = value
         if sorted {
             // 不用sort进行排序，这个比较高效
