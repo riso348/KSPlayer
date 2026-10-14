@@ -426,14 +426,7 @@ extension MEPlayerItem {
             self.readThread()
         }
         readOperation?.queuePriority = .veryHigh
-        // Not .userInteractive. The read loop runs flat out whenever the buffer
-        // refills — 80–100 Mbit/s of TLS + demux on a 90 s ring buffer — and at
-        // the top QoS it competed with decode and frame presentation: 24p pans
-        // juddered for exactly as long as the network was busy, while every
-        // pacing counter on our side stayed perfect. With a buffer that deep
-        // the reader has tens of seconds of slack; decode and display have
-        // 41 ms. Decode stays .userInteractive (MEPlayerItemTrack).
-        readOperation?.qualityOfService = .utility
+        readOperation?.qualityOfService = .userInteractive
         if let readOperation {
             operationQueue.addOperation(readOperation)
         }
