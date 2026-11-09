@@ -22,7 +22,10 @@ import Libavcodec
 
 final class PassthroughVideoDecode: DecodeProtocol {
     private let assetTrack: FFmpegAssetTrack
-    private let formatDescription: CMFormatDescription
+    private let options: KSOptions
+    private var formatDescription: CMFormatDescription
+    /// Profile 7: FEL / MEL is known from the first RPU; decided once.
+    private var profile7Decided = false
     /// After a flush the layer can only resume from a key frame.
     private var waitingForKeyFrame = true
     /// Profile 7 → 8.1, nil for single-layer profiles.
@@ -39,6 +42,7 @@ final class PassthroughVideoDecode: DecodeProtocol {
             return nil
         }
         self.assetTrack = assetTrack
+        self.options = options
         self.formatDescription = formatDescription
         profile7 = assetTrack.isDolbyVisionProfile7 ? DolbyVisionProfile7Converter() : nil
         nalLengthSize = assetTrack.nalLengthSize
@@ -85,7 +89,9 @@ final class PassthroughVideoDecode: DecodeProtocol {
     private func reportProfile7() {
         guard let profile7, let layer = profile7.enhancementLayer, layer != reportedEnhancementLayer else { return }
         reportedEnhancementLayer = layer
-        let info = "Dolby Vision P7 \(layer.rawValue) → 8.1 · \(codecTag)"
+        let info = profile7.baseLayerOnly
+            ? "Dolby Vision P7 FEL → HDR10 base layer · hvc1"
+            : "Dolby Vision P7 \(layer.rawValue) → 8.1 · \(codecTag)"
         KSLog("[passthrough] \(info), RPUs converted \(profile7.convertedCount), kept \(profile7.failedCount)")
         let assetTrack = assetTrack
         DispatchQueue.main.async {
@@ -115,7 +121,17 @@ final class PassthroughVideoDecode: DecodeProtocol {
         var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: decodeTimeStamp(pts: presentationTime))
         let made: CMSampleBuffer?
         if let profile7 {
-            guard var converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize) else {
+            var converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize)
+            if !profile7Decided, let layer = profile7.enhancementLayer {
+                profile7Decided = true
+                // Before the first sample reaches the layer: FEL as HDR10.
+                if layer == .fel, options.dolbyVisionFELAsHDR10, let hdr10 = assetTrack.hdr10FormatDescription() {
+                    profile7.baseLayerOnly = true
+                    formatDescription = hdr10
+                    converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize)
+                }
+            }
+            guard var converted else {
                 KSLog("[passthrough] malformed profile 7 sample at pts \(pts), dropped")
                 // Later frames may reference it: resume at the next key frame.
                 waitingForKeyFrame = true

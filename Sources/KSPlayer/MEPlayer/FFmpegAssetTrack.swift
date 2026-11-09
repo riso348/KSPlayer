@@ -324,10 +324,30 @@ extension FFmpegAssetTrack {
     /// configuration box ("dvcC" ≤ profile 7, "dvvC" 8–10), as AVFoundation
     /// builds it for a Dolby Vision MP4 sample entry.
     func dolbyVisionFormatDescription(codecType: CMVideoCodecType) -> CMFormatDescription? {
+        layerFormatDescription(codecType: codecType, dolbyVision: true)
+    }
+
+    /// Plain HEVC (base layer only) for the passthrough layer.
+    func hdr10FormatDescription() -> CMFormatDescription? {
+        layerFormatDescription(codecType: kCMVideoCodecType_HEVC, dolbyVision: false)
+    }
+
+    private func layerFormatDescription(codecType: CMVideoCodecType, dolbyVision: Bool) -> CMFormatDescription? {
         guard let formatDescription, let dovi else { return nil }
         let extensions = (CMFormatDescriptionGetExtensions(formatDescription) as NSDictionary?)?.mutableCopy() as? NSMutableDictionary ?? NSMutableDictionary()
         let atomsKey = kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String
         let atoms = (extensions[atomsKey] as? NSDictionary)?.mutableCopy() as? NSMutableDictionary ?? NSMutableDictionary()
+        guard dolbyVision else {
+            for name in ["dvcC", "dvvC", "dvwC"] {
+                atoms.removeObject(forKey: name)
+            }
+            extensions[atomsKey] = atoms
+            extensions.removeObject(forKey: kCVPixelBufferPixelFormatTypeKey)
+            extensions.removeObject(forKey: "EnableHardwareAcceleratedVideoDecoder")
+            var out: CMFormatDescription?
+            CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: codecType, width: codecpar.width, height: codecpar.height, extensions: extensions, formatDescriptionOut: &out)
+            return out
+        }
         // Profile 7 is converted to 8.1: no enhancement layer, HDR10 base.
         let profile = dovi.dv_profile == 7 ? 8 : dovi.dv_profile
         let elPresent = dovi.dv_profile == 7 ? 0 : dovi.el_present_flag

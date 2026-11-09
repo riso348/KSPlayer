@@ -108,6 +108,11 @@ open class KSOptions {
     /// PCM (height channels kept) instead of FFmpeg's 7.1 downmix. Needs
     /// `KSOptions.audioPlayerType = AudioRendererPlayer`. See TrueHDAtmosDecode.
     public var trueHDAtmosRendering = false
+    /// Dolby Vision profile 7 FEL (full enhancement layer): the 8.1
+    /// conversion drops the enhancement layer, and the RPU was graded for
+    /// base + enhancement, so the picture can come out worse than the plain
+    /// HDR10 base layer. true = play FEL titles as HDR10; MEL is unaffected.
+    public var dolbyVisionFELAsHDR10 = true
     /// Codec type of the Dolby Vision format description handed to the layer.
     public var dolbyVisionCodecType: CMVideoCodecType = kCMVideoCodecType_DolbyVisionHEVC
     /// Set once the opened stream's video track actually goes through passthrough.

@@ -297,7 +297,13 @@ public final class MetalPlayView: UIView, VideoOutput {
                 if sendCriteria {
                     // TV mode (Dolby Vision, frame rate) from the format
                     // description the layer decodes, not from a pixel buffer.
-                    self.options.updateVideo(refreshRate: fps, isDovi: true, formatDescription: sampleBuffer.formatDescription)
+                    // Dolby Vision unless the stream was reduced to its
+                    // HDR10 base layer (profile 7 FEL, see KSOptions).
+                    let atoms = sampleBuffer.formatDescription.flatMap {
+                        CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? NSDictionary
+                    }
+                    let isDovi = atoms.map { $0["dvcC"] != nil || $0["dvvC"] != nil || $0["dvwC"] != nil } ?? true
+                    self.options.updateVideo(refreshRate: fps, isDovi: isDovi, formatDescription: sampleBuffer.formatDescription)
                 }
             }
         }

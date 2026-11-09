@@ -39,6 +39,8 @@ final class DolbyVisionProfile7Converter {
     }
 
     let mode: Mode
+    /// Drop the RPU too: a plain HDR10 HEVC stream (base layer only).
+    var baseLayerOnly = false
     /// From the last RPU that carried mapping data.
     private(set) var enhancementLayer: EnhancementLayer?
     private(set) var convertedCount = 0
@@ -74,6 +76,9 @@ final class DolbyVisionProfile7Converter {
                 // Enhancement layer.
                 continue
             case 62:
+                if baseLayerOnly {
+                    continue
+                }
                 if let rpu = convertRPUNAL(nal), nalLengthSize == 4 || rpu.count < 1 << (8 * nalLengthSize) {
                     appendLength(rpu.count)
                     out += rpu
