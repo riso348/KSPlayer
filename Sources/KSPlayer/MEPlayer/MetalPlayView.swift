@@ -341,7 +341,13 @@ public final class MetalPlayView: UIView, VideoOutput {
                 let pts = sampleBuffer.presentationTimeStamp
                 let start = passthroughPrefillStart ?? pts
                 passthroughPrefillStart = start
-                let horizon = synchronizer.rate > 0 ? synchronizer.currentTime() + Self.decodedLead : start + Self.decodedLead
+                // The clock only counts once it is near these frames: right
+                // after a seek it still shows the old position (backward: far
+                // ahead of them — every frame would look due, the queue
+                // would drain and playback would never be judged ready).
+                let now = synchronizer.currentTime()
+                let running = synchronizer.rate > 0 && abs((pts - now).seconds) < 3
+                let horizon = running ? now + Self.decodedLead : start + Self.decodedLead
                 if pts > horizon, !frame.isDiscontinuity {
                     passthroughHeld = frame
                     if !passthroughRetryScheduled {

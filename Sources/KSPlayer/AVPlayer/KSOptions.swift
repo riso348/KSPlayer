@@ -122,6 +122,9 @@ open class KSOptions {
     /// so Dolby Vision is kept). Compressed samples made the layer decode
     /// just in time and drop ~20 % of 4K frames on Apple TV.
     public var dolbyVisionDecodeAhead = true
+    /// Read http(s) through URLSession instead of FFmpeg's GnuTLS (software
+    /// AES — a whole core at 230 Mbit/s on Apple TV). See URLSessionAVIOContext.
+    public var urlSessionIO = false
     /// Codec type of the Dolby Vision format description handed to the layer.
     public var dolbyVisionCodecType: CMVideoCodecType = kCMVideoCodecType_DolbyVisionHEVC
     /// Set once the opened stream's video track actually goes through passthrough.
@@ -478,8 +481,12 @@ open class KSOptions {
 //        }
     }
 
-    open func process(url _: URL) -> AbstractAVIOContext? {
-        nil
+    open func process(url: URL) -> AbstractAVIOContext? {
+        // RMDB fork: http(s) through URLSession (hardware AES), see URLSessionAVIOContext.
+        if urlSessionIO, let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" {
+            return URLSessionAVIOContext(url: url, headers: httpHeaders)
+        }
+        return nil
     }
 }
 
