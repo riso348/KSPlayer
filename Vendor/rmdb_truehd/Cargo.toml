@@ -1,0 +1,19 @@
+[package]
+name = "rmdb_truehd"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "C API over the truehd crate for KSPlayer: TrueHD Atmos elements + object metadata"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+truehd = { version = "=0.7.2", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

@@ -311,6 +311,14 @@ protocol DecodeProtocol {
 }
 
 extension SyncPlayerItemTrack {
+    private static func makeAtmosDecode(assetTrack: FFmpegAssetTrack, options: KSOptions) -> DecodeProtocol? {
+        #if canImport(RMDBTrueHD)
+        return TrueHDAtmosDecode(assetTrack: assetTrack, options: options)
+        #else
+        return nil
+        #endif
+    }
+
     func makeDecode(assetTrack: FFmpegAssetTrack) -> DecodeProtocol {
         autoreleasepool {
             if mediaType == .subtitle {
@@ -321,6 +329,8 @@ extension SyncPlayerItemTrack {
                 return decoder
             } else if assetTrack.isPassthrough, mediaType == .audio {
                 return PassthroughAudioDecode(assetTrack: assetTrack, options: options)
+            } else if assetTrack.isAtmosRendering, mediaType == .audio, let decoder = Self.makeAtmosDecode(assetTrack: assetTrack, options: options) {
+                return decoder
             } else {
                 if mediaType == .video, options.asynchronousDecompression, options.hardwareDecode,
                    let session = DecompressionSession(assetTrack: assetTrack, options: options)

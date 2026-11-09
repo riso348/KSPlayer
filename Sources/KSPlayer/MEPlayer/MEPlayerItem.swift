@@ -337,6 +337,10 @@ extension MEPlayerItem {
         for track in assetTracks where track.mediaType == .audio {
             track.isPassthrough = track === selected && options.eac3Passthrough && Self.canUseSystemRenderers
                 && track.codecID == AV_CODEC_ID_EAC3
+            #if canImport(RMDBTrueHD)
+            track.isAtmosRendering = track === selected && options.trueHDAtmosRendering && Self.canUseSystemRenderers
+                && track.isTrueHDAtmos
+            #endif
         }
     }
 

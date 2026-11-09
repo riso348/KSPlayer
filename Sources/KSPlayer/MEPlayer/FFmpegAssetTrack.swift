@@ -43,6 +43,12 @@ public class FFmpegAssetTrack: MediaPlayerTrack {
     /// RMDB fork: packets go to the system renderers still compressed
     /// (Dolby Vision video / E-AC-3 audio), see `KSOptions.dolbyVisionPassthrough`.
     public internal(set) var isPassthrough = false
+    /// Decoded by TrueHDAtmosDecode (objects → 7.1.4) instead of FFmpeg.
+    public internal(set) var isAtmosRendering = false
+    /// TrueHD that FFmpeg marks as Atmos (AV_PROFILE_TRUEHD_ATMOS), 48 kHz.
+    var isTrueHDAtmos: Bool {
+        codecpar.codec_id == AV_CODEC_ID_TRUEHD && codecpar.profile == 30 && codecpar.sample_rate == 48000
+    }
     /// What the passthrough decoder found in the stream ("E-AC-3 5.1 · Atmos JOC 16"),
     /// or why it fell back to decoding. For diagnostics.
     public internal(set) var passthroughInfo: String?

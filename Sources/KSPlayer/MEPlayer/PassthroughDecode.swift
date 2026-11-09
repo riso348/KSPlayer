@@ -30,6 +30,9 @@ final class PassthroughVideoDecode: DecodeProtocol {
     private let nalLengthSize: Int
     private let codecTag: String
     private var reportedEnhancementLayer: DolbyVisionProfile7Converter.EnhancementLayer?
+    /// Decode timestamps for the layer (see `decodeTimeStamp(pts:)`).
+    private let frameDuration: CMTime
+    private var lastDTS: CMTime?
 
     init?(assetTrack: FFmpegAssetTrack, options: KSOptions) {
         guard let formatDescription = assetTrack.dolbyVisionFormatDescription(codecType: options.dolbyVisionCodecType) else {
@@ -40,10 +43,42 @@ final class PassthroughVideoDecode: DecodeProtocol {
         profile7 = assetTrack.isDolbyVisionProfile7 ? DolbyVisionProfile7Converter() : nil
         nalLengthSize = assetTrack.nalLengthSize
         codecTag = options.dolbyVisionCodecType == kCMVideoCodecType_DolbyVisionHEVC ? "dvh1" : "hvc1"
+        let fps = assetTrack.nominalFrameRate > 1 ? Double(assetTrack.nominalFrameRate) : 24000.0 / 1001
+        frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 1_000_000_000)
         if let dovi = assetTrack.dovi {
             let profile = profile7 != nil ? "P7.\(dovi.dv_bl_signal_compatibility_id) → 8.1" : "P\(dovi.dv_profile).\(dovi.dv_bl_signal_compatibility_id)"
             assetTrack.passthroughInfo = "Dolby Vision \(profile) · \(codecTag)"
         }
+    }
+
+    /// Matroska has no DTS. FFmpeg guesses one from a window of PTS values
+    /// — missing for the first frames after every seek, then a few frames
+    /// behind — so the layer got a mix of valid and invalid DTS. Without a
+    /// DTS it can only schedule decoding by PTS, and with B-frames (decode
+    /// order ≠ display order) that leaves frames late: judder.
+    ///
+    /// Decode order is enqueue order, so a DTS that steps one frame per
+    /// sample, starting `lead` frames before the first key frame's PTS, is
+    /// monotonic and stays below every PTS as long as frames are reordered
+    /// by fewer than `lead` positions (UHD Blu-ray: ≤ 3).
+    private func decodeTimeStamp(pts: CMTime) -> CMTime {
+        let lead: Int32 = 8
+        let tick = CMTime(value: 1, timescale: 1_000_000_000)
+        var dts: CMTime
+        if let lastDTS {
+            dts = lastDTS + frameDuration
+            // Never past a frame that is shown sooner (a reordered B-frame).
+            dts = CMTimeMinimum(dts, pts - frameDuration)
+            // Too far behind (dropped frames, rate mismatch): pull it back up.
+            if pts - dts > CMTimeMultiply(frameDuration, multiplier: 2 * lead) {
+                dts = pts - CMTimeMultiply(frameDuration, multiplier: lead)
+            }
+            dts = CMTimeMaximum(dts, lastDTS + tick)
+        } else {
+            dts = pts - CMTimeMultiply(frameDuration, multiplier: lead)
+        }
+        lastDTS = dts
+        return dts
     }
 
     /// The diagnostics line learns MEL / FEL from the first converted RPU.
@@ -72,11 +107,12 @@ final class PassthroughVideoDecode: DecodeProtocol {
         let timebase = assetTrack.timebase
         let pts = corePacket.pts != Int64.min ? corePacket.pts : corePacket.dts
         guard pts != Int64.min else { return }
-        // Matroska carries no DTS; enqueue order is decode order, which is
-        // all the layer needs.
-        let dts = corePacket.dts != Int64.min ? timebase.cmtime(for: corePacket.dts) : CMTime.invalid
+        if isDiscontinuity {
+            lastDTS = nil
+        }
+        let presentationTime = timebase.cmtime(for: pts)
         let duration = corePacket.duration > 0 ? timebase.cmtime(for: corePacket.duration) : CMTime.invalid
-        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: timebase.cmtime(for: pts), decodeTimeStamp: dts)
+        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: decodeTimeStamp(pts: presentationTime))
         let made: CMSampleBuffer?
         if let profile7 {
             guard var converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize) else {
@@ -127,6 +163,13 @@ final class PassthroughVideoDecode: DecodeProtocol {
 }
 
 extension CMSampleBuffer {
+    var isDoNotDisplay: Bool {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(self, createIfNecessary: false) as? [NSDictionary],
+              let first = attachments.first
+        else { return false }
+        return first[kCMSampleAttachmentKey_DoNotDisplay] as? Bool ?? false
+    }
+
     var isNotSync: Bool {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(self, createIfNecessary: false) as? [NSDictionary],
               let first = attachments.first

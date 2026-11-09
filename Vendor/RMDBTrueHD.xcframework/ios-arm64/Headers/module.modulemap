@@ -1,0 +1,4 @@
+module RMDBTrueHD {
+    header "rmdb_truehd.h"
+    export *
+}

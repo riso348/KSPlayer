@@ -25,6 +25,9 @@ let package = Package(
 //                .product(name: "Libass", package: "FFmpegKit"),
 //                .product(name: "Libmpv", package: "FFmpegKit"),
                 "DisplayCriteria",
+                // TrueHD Atmos decoder (Rust, Vendor/rmdb_truehd). No Rust
+                // target for visionOS / Catalyst: those builds play TrueHD as 7.1.
+                .target(name: "RMDBTrueHD", condition: .when(platforms: [.iOS, .tvOS, .macOS])),
             ],
             resources: [.process("Metal/Shaders.metal")],
             swiftSettings: [
@@ -33,6 +36,10 @@ let package = Package(
         ),
         .target(
             name: "DisplayCriteria"
+        ),
+        .binaryTarget(
+            name: "RMDBTrueHD",
+            path: "Vendor/RMDBTrueHD.xcframework"
         ),
         .testTarget(
             name: "KSPlayerTests",

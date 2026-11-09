@@ -104,6 +104,10 @@ open class KSOptions {
     /// AVSampleBufferAudioRenderer instead of decoding it to PCM, which loses
     /// the Atmos objects. Same audio-output requirement as above.
     public var eac3Passthrough = false
+    /// TrueHD Atmos: decode the object presentation and render it to 7.1.4
+    /// PCM (height channels kept) instead of FFmpeg's 7.1 downmix. Needs
+    /// `KSOptions.audioPlayerType = AudioRendererPlayer`. See TrueHDAtmosDecode.
+    public var trueHDAtmosRendering = false
     /// Codec type of the Dolby Vision format description handed to the layer.
     public var dolbyVisionCodecType: CMVideoCodecType = kCMVideoCodecType_DolbyVisionHEVC
     /// Set once the opened stream's video track actually goes through passthrough.

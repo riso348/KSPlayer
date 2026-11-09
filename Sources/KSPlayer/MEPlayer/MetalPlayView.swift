@@ -82,6 +82,29 @@ public final class MetalPlayView: UIView, VideoOutput {
     private var passthroughRetryScheduled = false
     private var passthroughCriteriaSent = false
     public var passthroughLayer: AVSampleBufferDisplayLayer? { passthroughView?.displayLayer }
+
+    /// Passthrough feed health for diagnostics: how far ahead of the
+    /// synchronizer clock frames reach the layer. A frame enqueued after its
+    /// presentation time is shown late or skipped — judder.
+    public struct PassthroughFeedStats {
+        public var enqueued = 0
+        public var late = 0
+        public var minLeadMs = Double.infinity
+        public var maxLeadMs = -Double.infinity
+    }
+
+    private let passthroughStatsLock = NSLock()
+    private var passthroughStats = PassthroughFeedStats()
+
+    /// Stats since the last call.
+    public func readPassthroughStats() -> PassthroughFeedStats {
+        passthroughStatsLock.lock()
+        defer {
+            passthroughStats = PassthroughFeedStats()
+            passthroughStatsLock.unlock()
+        }
+        return passthroughStats
+    }
     public init(options: KSOptions) {
         self.options = options
         super.init(frame: .zero)
@@ -254,6 +277,15 @@ public final class MetalPlayView: UIView, VideoOutput {
                 passthroughNeedsKeyFrame = false
             }
             layer.enqueue(sampleBuffer)
+            if let synchronizer = passthroughSynchronizer, synchronizer.rate > 0, !sampleBuffer.isDoNotDisplay {
+                let lead = (sampleBuffer.presentationTimeStamp - synchronizer.currentTime()).seconds * 1000
+                passthroughStatsLock.lock()
+                passthroughStats.enqueued += 1
+                if lead < 0 { passthroughStats.late += 1 }
+                passthroughStats.minLeadMs = min(passthroughStats.minLeadMs, lead)
+                passthroughStats.maxLeadMs = max(passthroughStats.maxLeadMs, lead)
+                passthroughStatsLock.unlock()
+            }
             let time = frame.cmtime
             let position = frame.position
             let fps = frame.fps
