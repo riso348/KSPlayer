@@ -44,6 +44,48 @@ public class AudioRendererPlayer: AudioOutput {
     private let serializationQueue = DispatchQueue(label: "ks.player.serialization.queue")
     /// Frame `play()` had to read for its start time — enqueued first, not lost.
     private var pendingRender: AudioFrame?
+
+    /// RMDB fork, diagnostics: renderer state and how far ahead of the clock
+    /// audio is queued. The synchronizer's clock follows the audio renderer,
+    /// so audio running dry stalls the picture too.
+    public struct FeedStats {
+        public var status = "unknown"
+        public var errorCode = 0
+        public var channels = 0
+        public var minLeadMs = Double.infinity
+        /// Requests for more audio that found nothing decoded.
+        public var underruns = 0
+    }
+
+    private let statsLock = NSLock()
+    private var stats = FeedStats()
+
+    /// Stats since the last call (status, error and channels are current).
+    public func readFeedStats() -> FeedStats {
+        statsLock.lock()
+        defer {
+            stats.minLeadMs = .infinity
+            stats.underruns = 0
+            statsLock.unlock()
+        }
+        var out = stats
+        switch renderer.status {
+        case .rendering: out.status = "rendering"
+        case .failed: out.status = "FAILED"
+        default: out.status = "waiting"
+        }
+        out.errorCode = (renderer.error as NSError?)?.code ?? 0
+        return out
+    }
+
+    private func recordEnqueue(_ sampleBuffer: CMSampleBuffer, channels: Int) {
+        let end = sampleBuffer.presentationTimeStamp + sampleBuffer.duration
+        let lead = end.isValid ? (end - synchronizer.currentTime()).seconds * 1000 : .infinity
+        statsLock.lock()
+        stats.channels = channels
+        stats.minLeadMs = min(stats.minLeadMs, lead)
+        statsLock.unlock()
+    }
     var isPaused: Bool {
         synchronizer.rate == 0
     }
@@ -129,11 +171,15 @@ public class AudioRendererPlayer: AudioOutput {
     private func request() {
         while renderer.isReadyForMoreMediaData, !isPaused {
             guard var render = nextRender() else {
+                statsLock.lock()
+                stats.underruns += 1
+                statsLock.unlock()
                 break
             }
             if let sampleBuffer = render.compressedSampleBuffer {
                 // Passthrough E-AC-3: one packet per buffer, no merging.
                 renderer.enqueue(sampleBuffer)
+                recordEnqueue(sampleBuffer, channels: Int(render.audioFormat.channelCount))
                 #if !os(macOS)
                 let channelCount = Int(render.audioFormat.channelCount)
                 if AVAudioSession.sharedInstance().preferredOutputNumberOfChannels != channelCount {
@@ -158,6 +204,7 @@ public class AudioRendererPlayer: AudioOutput {
                 let channelCount = render.audioFormat.channelCount
                 renderer.audioTimePitchAlgorithm = channelCount > 2 ? .spectral : .timeDomain
                 renderer.enqueue(sampleBuffer)
+                recordEnqueue(sampleBuffer, channels: Int(channelCount))
                 #if !os(macOS)
                 if AVAudioSession.sharedInstance().preferredOutputNumberOfChannels != channelCount {
                     try? AVAudioSession.sharedInstance().setPreferredOutputNumberOfChannels(Int(channelCount))
