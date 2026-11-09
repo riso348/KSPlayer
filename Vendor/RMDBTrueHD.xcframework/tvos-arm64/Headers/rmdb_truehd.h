@@ -52,6 +52,16 @@ typedef struct ThdFrame {
     ThdUpdate updates[THD_MAX_UPDATES];
 } ThdFrame;
 
+/// One access unit rendered to 7.1.4, kAudioChannelLayoutTag_Atmos_7_1_4 order
+/// (L R C LFE Ls Rs Lrs Rrs Ltf Rtf Ltr Rtr).
+typedef struct ThdRendered {
+    uint32_t sample_rate;
+    uint32_t sample_count;
+    uint32_t element_count;
+    /// Interleaved [sample][12], full scale ±1.
+    float pcm[THD_MAX_SAMPLES * 12];
+} ThdRendered;
+
 ThdDecoder *thd_decoder_new(void);
 void thd_decoder_free(ThdDecoder *decoder);
 /// Drops all state (seek). Decoding resumes at the next major sync.
@@ -60,6 +70,8 @@ void thd_decoder_reset(ThdDecoder *decoder);
 int32_t thd_decoder_push(ThdDecoder *decoder, const uint8_t *data, size_t length);
 /// 1 = `out` filled, 0 = nothing waiting, −1 = fault.
 int32_t thd_decoder_next(ThdDecoder *decoder, ThdFrame *out);
+/// Like thd_decoder_next, rendered to 7.1.4 (renderer state kept across calls).
+int32_t thd_decoder_next_rendered(ThdDecoder *decoder, ThdRendered *out);
 uint64_t thd_decoder_error_count(const ThdDecoder *decoder);
 
 #endif

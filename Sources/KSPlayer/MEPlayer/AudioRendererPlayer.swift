@@ -57,6 +57,8 @@ public class AudioRendererPlayer: AudioOutput {
         public var underruns = 0
     }
 
+    /// Set while a re-arm of requestMediaDataWhenReady is scheduled.
+    private var rearmScheduled = false
     private let statsLock = NSLock()
     private var stats = FeedStats()
 
@@ -79,7 +81,12 @@ public class AudioRendererPlayer: AudioOutput {
     }
 
     private func recordEnqueue(_ sampleBuffer: CMSampleBuffer, channels: Int) {
-        let end = sampleBuffer.presentationTimeStamp + sampleBuffer.duration
+        // PCM buffers carry no duration (see AudioFrame.toCMSampleBuffer): use the sample count.
+        var duration = sampleBuffer.duration
+        if !duration.isValid, let asbd = sampleBuffer.formatDescription?.audioStreamBasicDescription, asbd.mSampleRate > 0 {
+            duration = CMTime(value: CMTimeValue(sampleBuffer.numSamples) * CMTimeValue(max(asbd.mFramesPerPacket, 1)), timescale: CMTimeScale(asbd.mSampleRate))
+        }
+        let end = sampleBuffer.presentationTimeStamp + duration
         let lead = end.isValid ? (end - synchronizer.currentTime()).seconds * 1000 : .infinity
         statsLock.lock()
         stats.channels = channels
@@ -174,6 +181,22 @@ public class AudioRendererPlayer: AudioOutput {
                 statsLock.lock()
                 stats.underruns += 1
                 statsLock.unlock()
+                // Nothing decoded yet. Returning while the renderer is still
+                // ready makes it call straight back — a busy loop (thousands
+                // a second) that takes the CPU the decoder needs. Look again
+                // in 10 ms instead.
+                renderer.stopRequestingMediaData()
+                if !rearmScheduled {
+                    rearmScheduled = true
+                    serializationQueue.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+                        guard let self else { return }
+                        self.rearmScheduled = false
+                        guard !self.isPaused else { return }
+                        self.renderer.requestMediaDataWhenReady(on: self.serializationQueue) { [weak self] in
+                            self?.request()
+                        }
+                    }
+                }
                 break
             }
             if let sampleBuffer = render.compressedSampleBuffer {

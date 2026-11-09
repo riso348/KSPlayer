@@ -9,6 +9,8 @@
 //! Every entry point catches panics: a malformed stream must never take the
 //! player down, it just loses audio until the next major sync.
 
+mod render;
+
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -74,7 +76,20 @@ pub struct ThdFrame {
     pub updates: [ThdUpdate; THD_MAX_UPDATES],
 }
 
+/// One decoded access unit, rendered to 7.1.4
+/// (kAudioChannelLayoutTag_Atmos_7_1_4 order: L R C LFE Ls Rs Lrs Rrs Ltf Rtf Ltr Rtr).
+#[repr(C)]
+pub struct ThdRendered {
+    pub sample_rate: u32,
+    pub sample_count: u32,
+    /// Elements (beds + objects) in the presentation.
+    pub element_count: u32,
+    /// Interleaved `[sample][12]`, full scale ±1.
+    pub pcm: [f32; THD_MAX_SAMPLES * render::OUTPUTS],
+}
+
 pub struct ThdDecoder {
+    renderer: render::Renderer,
     extractor: Extractor,
     parser: Parser,
     decoder: Decoder,
@@ -87,6 +102,7 @@ pub struct ThdDecoder {
 impl ThdDecoder {
     fn new() -> Self {
         Self {
+            renderer: render::Renderer::default(),
             extractor: Extractor::default(),
             parser: Parser::default(),
             decoder: Decoder::default(),
@@ -271,6 +287,46 @@ pub unsafe extern "C" fn thd_decoder_next(decoder: *mut ThdDecoder, out: *mut Th
     let (Some(decoder), Some(out)) = (unsafe { decoder.as_mut() }, unsafe { out.as_mut() }) else { return -1 };
     let Some(decoded) = decoder.ready.pop_front() else { return 0 };
     match catch_unwind(AssertUnwindSafe(|| fill(&decoded, out))) {
+        Ok(()) => 1,
+        Err(_) => -1,
+    }
+}
+
+/// Takes the next decoded access unit rendered to 7.1.4. Returns 1 when
+/// `out` was filled, 0 when none is waiting.
+///
+/// # Safety
+/// `decoder` comes from `thd_decoder_new`; `out` points to a `ThdRendered`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn thd_decoder_next_rendered(decoder: *mut ThdDecoder, out: *mut ThdRendered) -> i32 {
+    let (Some(decoder), Some(out)) = (unsafe { decoder.as_mut() }, unsafe { out.as_mut() }) else { return -1 };
+    let Some(decoded) = decoder.ready.pop_front() else { return 0 };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let samples = decoded.sample_length.min(THD_MAX_SAMPLES);
+        let elements = decoded.channel_count.min(THD_MAX_ELEMENTS);
+        let mut input = vec![0f32; samples * elements];
+        const SCALE: f32 = 1.0 / 8_388_608.0;
+        for s in 0..samples {
+            for e in 0..elements {
+                input[s * elements + e] = decoded.pcm_data[s][e] as f32 * SCALE;
+            }
+        }
+        let updates = decoded
+            .oamd
+            .iter()
+            .filter_map(update_from)
+            .map(|update| render::Update {
+                sample_offset: i64::from(update.sample_offset),
+                ramp: update.ramp as usize,
+                elements: update.elements[..update.element_count as usize].to_vec(),
+            })
+            .collect();
+        decoder.renderer.render(&input, elements, samples, updates, &mut out.pcm);
+        out.sample_rate = decoded.sampling_frequency;
+        out.sample_count = samples as u32;
+        out.element_count = elements as u32;
+    }));
+    match result {
         Ok(()) => 1,
         Err(_) => -1,
     }
