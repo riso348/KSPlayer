@@ -251,6 +251,10 @@ public final class AudioFrame: MEFrame {
     public var size: Int32 = 0
     public var data: [UnsafeMutablePointer<UInt8>?]
     public var numberOfSamples: UInt32 = 0
+    /// Passthrough (RMDB fork): the still-compressed packet (E-AC-3) for
+    /// AVSampleBufferAudioRenderer. `data` is empty; `audioFormat` is the
+    /// track's PCM format, kept only for channel count / sample rate.
+    public internal(set) var compressedSampleBuffer: CMSampleBuffer?
     public init(dataSize: Int, audioFormat: AVAudioFormat) {
         self.dataSize = dataSize
         self.audioFormat = audioFormat
@@ -428,6 +432,12 @@ public final class VideoVTBFrame: MEFrame {
     public let isDovi: Bool
     public var edrMetaData: EDRMetaData? = nil
     var corePixelBuffer: PixelBufferProtocol?
+    /// Passthrough (RMDB fork): the still-compressed sample, in decode order,
+    /// for an AVSampleBufferDisplayLayer to decode. `corePixelBuffer` is nil.
+    var sampleBuffer: CMSampleBuffer?
+    /// Passthrough: first frame after a seek / flush — the layer must be
+    /// flushed before it is enqueued. Always a key frame.
+    var isDiscontinuity = false
     init(fps: Float, isDovi: Bool) {
         self.fps = fps
         self.isDovi = isDovi

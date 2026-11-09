@@ -40,6 +40,13 @@ public class FFmpegAssetTrack: MediaPlayerTrack {
     var closedCaptionsTrack: FFmpegAssetTrack?
     let isConvertNALSize: Bool
     var seekByBytes = false
+    /// RMDB fork: packets go to the system renderers still compressed
+    /// (Dolby Vision video / E-AC-3 audio), see `KSOptions.dolbyVisionPassthrough`.
+    public internal(set) var isPassthrough = false
+    /// What the passthrough decoder found in the stream ("E-AC-3 5.1 · Atmos JOC 16"),
+    /// or why it fell back to decoding. For diagnostics.
+    public internal(set) var passthroughInfo: String?
+    var codecID: AVCodecID { codecpar.codec_id }
     public var description: String {
         var description = codecName
         if let formatName {
@@ -280,5 +287,43 @@ extension FFmpegAssetTrack {
     var pixelFormatType: OSType? {
         let format = AVPixelFormat(codecpar.format)
         return format.osType(fullRange: formatDescription?.fullRangeVideo ?? false)
+    }
+
+    /// Dolby Vision profiles the system decoder handles from a single HEVC
+    /// track: 5 (IPT, no fallback) and 8 (HDR10 / SDR / HLG base + RPU).
+    /// Profile 7 (dual layer) is not supported by Apple.
+    var canPassthroughDolbyVision: Bool {
+        guard mediaType == .video, codecpar.codec_id == AV_CODEC_ID_HEVC, !isConvertNALSize,
+              formatDescription != nil, let dovi
+        else { return false }
+        return dovi.dv_profile == 5 || dovi.dv_profile == 8
+    }
+
+    /// The track's HEVC format description plus the Dolby Vision
+    /// configuration box ("dvcC" ≤ profile 7, "dvvC" 8–10), as AVFoundation
+    /// builds it for a Dolby Vision MP4 sample entry.
+    func dolbyVisionFormatDescription(codecType: CMVideoCodecType) -> CMFormatDescription? {
+        guard let formatDescription, let dovi else { return nil }
+        let extensions = (CMFormatDescriptionGetExtensions(formatDescription) as NSDictionary?)?.mutableCopy() as? NSMutableDictionary ?? NSMutableDictionary()
+        let atomsKey = kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String
+        let atoms = (extensions[atomsKey] as? NSDictionary)?.mutableCopy() as? NSMutableDictionary ?? NSMutableDictionary()
+        var box = [UInt8](repeating: 0, count: 24)
+        box[0] = dovi.dv_version_major
+        box[1] = dovi.dv_version_minor
+        box[2] = (dovi.dv_profile & 0x7F) << 1 | (dovi.dv_level >> 5) & 0x01
+        box[3] = (dovi.dv_level & 0x1F) << 3 | (dovi.rpu_present_flag & 1) << 2 | (dovi.el_present_flag & 1) << 1 | (dovi.bl_present_flag & 1)
+        box[4] = (dovi.dv_bl_signal_compatibility_id & 0x0F) << 4
+        let boxName = dovi.dv_profile > 10 ? "dvwC" : dovi.dv_profile > 7 ? "dvvC" : "dvcC"
+        atoms[boxName] = Data(box)
+        extensions[atomsKey] = atoms
+        // Decoder hints for our own VideoToolbox session — not for the layer.
+        extensions.removeObject(forKey: kCVPixelBufferPixelFormatTypeKey)
+        extensions.removeObject(forKey: "EnableHardwareAcceleratedVideoDecoder")
+        var out: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: codecType, width: codecpar.width, height: codecpar.height, extensions: extensions, formatDescriptionOut: &out)
+        if status != noErr {
+            KSLog("[passthrough] Dolby Vision format description failed: \(status)")
+        }
+        return out
     }
 }

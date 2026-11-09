@@ -91,6 +91,24 @@ open class KSOptions {
     public var videoInterlacingType: VideoInterlacingType?
     private var videoClockDelayCount = 0
 
+    // MARK: Native passthrough (RMDB fork)
+
+    /// Hand compressed Dolby Vision HEVC (profile 5 / 8) straight to an
+    /// AVSampleBufferDisplayLayer instead of decoding it ourselves: the system
+    /// decodes it and applies the per-scene RPU metadata, which our own
+    /// VideoToolbox + Metal path drops (the TV only gets the HDR10 base layer).
+    /// Takes effect only with `KSOptions.audioPlayerType = AudioRendererPlayer.self`,
+    /// whose AVSampleBufferRenderSynchronizer then drives video too.
+    public var dolbyVisionPassthrough = false
+    /// Hand compressed E-AC-3 (incl. Dolby Atmos / JOC) to
+    /// AVSampleBufferAudioRenderer instead of decoding it to PCM, which loses
+    /// the Atmos objects. Same audio-output requirement as above.
+    public var eac3Passthrough = false
+    /// Codec type of the Dolby Vision format description handed to the layer.
+    public var dolbyVisionCodecType: CMVideoCodecType = kCMVideoCodecType_DolbyVisionHEVC
+    /// Set once the opened stream's video track actually goes through passthrough.
+    public internal(set) var isVideoPassthroughActive = false
+
     public internal(set) var formatName = ""
     public internal(set) var prepareTime = 0.0
     public internal(set) var dnsStartTime = 0.0

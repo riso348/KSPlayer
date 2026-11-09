@@ -143,6 +143,8 @@ public final class MEPlayerItem: Sendable {
         }
         if assetTrack.mediaType == .video {
             findBestAudio(videoTrack: assetTrack)
+        } else if assetTrack.mediaType == .audio {
+            updateAudioPassthrough(selected: assetTrack)
         } else if assetTrack.mediaType == .subtitle {
             if assetTrack.isImageSubtitle {
                 if !options.isSeekImageSubtitle {
@@ -325,7 +327,21 @@ extension MEPlayerItem {
         outputPacket = av_packet_alloc()
     }
 
+    /// Passthrough needs AudioRendererPlayer: its synchronizer is the clock the
+    /// display layer runs on, and only it takes compressed audio.
+    static var canUseSystemRenderers: Bool {
+        KSOptions.audioPlayerType == AudioRendererPlayer.self
+    }
+
+    private func updateAudioPassthrough(selected: FFmpegAssetTrack) {
+        for track in assetTracks where track.mediaType == .audio {
+            track.isPassthrough = track === selected && options.eac3Passthrough && Self.canUseSystemRenderers
+                && track.codecID == AV_CODEC_ID_EAC3
+        }
+    }
+
     private func createCodec(formatCtx: UnsafeMutablePointer<AVFormatContext>) {
+        options.isVideoPassthroughActive = false
         allPlayerItemTracks.removeAll()
         assetTracks.removeAll()
         videoAdaptation = nil
@@ -375,6 +391,16 @@ extension MEPlayerItem {
                 }
                 naturalSize = abs(rotation - 90) <= 1 || abs(rotation - 270) <= 1 ? first.naturalSize.reverse : first.naturalSize
                 options.process(assetTrack: first)
+                // Before the track exists: its frame queue depends on it.
+                if options.dolbyVisionPassthrough, Self.canUseSystemRenderers,
+                   assetTracks.contains(where: { $0.mediaType == .audio }),
+                   options.videoFilters.isEmpty, first.canPassthroughDolbyVision,
+                   first.dolbyVisionFormatDescription(codecType: options.dolbyVisionCodecType) != nil
+                {
+                    first.isPassthrough = true
+                    options.isVideoPassthroughActive = true
+                    KSLog("[passthrough] video: Dolby Vision P\(first.dovi?.dv_profile ?? 0) to AVSampleBufferDisplayLayer")
+                }
                 let frameCapacity = options.videoFrameMaxCount(fps: first.nominalFrameRate, naturalSize: naturalSize, isLive: duration == 0)
                 let track = options.syncDecodeVideo ? SyncPlayerItemTrack<VideoVTBFrame>(mediaType: .video, frameCapacity: frameCapacity, options: options) : AsyncPlayerItemTrack<VideoVTBFrame>(mediaType: .video, frameCapacity: frameCapacity, options: options)
                 track.delegate = self
@@ -406,6 +432,7 @@ extension MEPlayerItem {
         }), first.codecpar.codec_id != AV_CODEC_ID_NONE {
             first.isEnabled = true
             options.process(assetTrack: first)
+            updateAudioPassthrough(selected: first)
             // 音频要比较所有的音轨，因为truehd的fps是1200，跟其他的音轨差距太大了
             let fps = audios.map(\.nominalFrameRate).max() ?? 44
             let frameCapacity = options.audioFrameMaxCount(fps: fps, channelCount: Int(first.audioDescriptor?.audioFormat.channelCount ?? 2))

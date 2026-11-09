@@ -57,7 +57,9 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         if mediaType == .audio {
             outputRenderQueue = CircularBuffer(initialCapacity: Int(frameCapacity), expanding: false)
         } else if mediaType == .video {
-            outputRenderQueue = CircularBuffer(initialCapacity: Int(frameCapacity), sorted: true, expanding: false)
+            // Passthrough frames are still-compressed samples: they must
+            // reach the layer in decode order, not sorted by PTS.
+            outputRenderQueue = CircularBuffer(initialCapacity: Int(frameCapacity), sorted: !options.isVideoPassthroughActive, expanding: false)
         } else {
             // 有的图片字幕不按顺序来输出，所以要排序下。
             outputRenderQueue = CircularBuffer(initialCapacity: Int(frameCapacity), sorted: true)
@@ -142,7 +144,18 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
                 if self.state == .flush || self.state == .closed {
                     return
                 }
-                if self.seekTime > 0 {
+                if self.seekTime > 0, let videoFrame = frame as? VideoVTBFrame, videoFrame.sampleBuffer != nil {
+                    // A compressed frame can't be dropped — later frames
+                    // reference it. Decode it, don't show it. Kept until well
+                    // past the target: frames arrive in decode order, so a
+                    // later one can still have an earlier PTS.
+                    let end = frame.timebase.cmtime(for: frame.timestamp + frame.duration).seconds
+                    if end < self.seekTime {
+                        videoFrame.markDoNotDisplay()
+                    } else if end > self.seekTime + 2 {
+                        self.seekTime = 0.0
+                    }
+                } else if self.seekTime > 0 {
                     let timestamp = frame.timestamp + frame.duration
 //                    KSLog("seektime \(self.seekTime), frame \(frame.seconds), mediaType \(packet.assetTrack.mediaType)")
                     if timestamp <= 0 || frame.timebase.cmtime(for: timestamp).seconds < self.seekTime {
@@ -302,6 +315,12 @@ extension SyncPlayerItemTrack {
         autoreleasepool {
             if mediaType == .subtitle {
                 return SubtitleDecode(assetTrack: assetTrack, options: options)
+            } else if assetTrack.isPassthrough, mediaType == .video,
+                      let decoder = PassthroughVideoDecode(assetTrack: assetTrack, options: options)
+            {
+                return decoder
+            } else if assetTrack.isPassthrough, mediaType == .audio {
+                return PassthroughAudioDecode(assetTrack: assetTrack, options: options)
             } else {
                 if mediaType == .video, options.asynchronousDecompression, options.hardwareDecode,
                    let session = DecompressionSession(assetTrack: assetTrack, options: options)

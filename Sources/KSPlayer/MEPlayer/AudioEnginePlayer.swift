@@ -149,6 +149,16 @@ public class AudioEnginePlayer: AudioOutput {
         }
     }
 
+    #if !os(macOS)
+    /// Re-reads `outputLatency` while playing. It used to be read only at init
+    /// and on flush (seek, track switch, route change), but the TV / soundbar
+    /// / AirPlay receiver can change it mid-playback without a route change
+    /// (HDMI renegotiation, eARC, HomePod). The audio clock then stayed off by
+    /// the difference — a lip-sync slip that lasted until the next seek.
+    private static let latencyRefreshInterval: TimeInterval = 2
+    private var latencyTimer: DispatchSourceTimer?
+    #endif
+
     public required init() {
         engine.attach(timePitch)
         if let audioUnit = engine.outputNode.audioUnit {
@@ -156,8 +166,33 @@ public class AudioEnginePlayer: AudioOutput {
         }
         #if !os(macOS)
         outputLatency = AVAudioSession.sharedInstance().outputLatency
+        // Main queue on purpose: reading the session on the audio thread
+        // causes dropouts (see flush()).
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.latencyRefreshInterval, repeating: Self.latencyRefreshInterval)
+        timer.setEventHandler { [weak self] in
+            self?.refreshOutputLatency()
+        }
+        timer.resume()
+        latencyTimer = timer
         #endif
     }
+
+    deinit {
+        #if !os(macOS)
+        latencyTimer?.cancel()
+        #endif
+    }
+
+    #if !os(macOS)
+    private func refreshOutputLatency() {
+        guard engine.isRunning else { return }
+        let latency = AVAudioSession.sharedInstance().outputLatency
+        guard abs(latency - outputLatency) > 0.001 else { return }
+        KSLog("[audio] outputLatency changed \(Int(outputLatency * 1000)) ms → \(Int(latency * 1000)) ms")
+        outputLatency = latency
+    }
+    #endif
 
     public func prepare(audioFormat: AVAudioFormat) {
         if sourceNodeAudioFormat == audioFormat {

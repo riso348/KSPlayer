@@ -207,6 +207,13 @@ extension KSMEPlayer: MEPlayerDelegate {
                 KSLog("[audio] audio type: \(audioOutput) prepare audioFormat )")
                 audioOutput.prepare(audioFormat: audioDescriptor.audioFormat)
             }
+            // RMDB fork: compressed Dolby Vision → a display layer on the
+            // audio renderer's synchronizer (MEPlayerItem decided per track).
+            if options.isVideoPassthroughActive, let renderer = audioOutput as? AudioRendererPlayer,
+               let view = videoOutput as? MetalPlayView
+            {
+                view.enablePassthrough(synchronizer: renderer.synchronizer)
+            }
             if let controlTimebase = videoOutput?.displayLayer.controlTimebase, options.startPlayTime > 1 {
                 CMTimebaseSetTime(controlTimebase, time: CMTimeMake(value: Int64(options.startPlayTime), timescale: 1))
             }
@@ -317,6 +324,8 @@ extension KSMEPlayer: MediaPlayerProtocol {
     public func replace(url: URL, options: KSOptions) {
         KSLog("replaceUrl \(self)")
         shutdown()
+        // The next stream decides again in sourceDidOpened.
+        (videoOutput as? MetalPlayView)?.disablePassthrough()
         playerItem.delegate = nil
         playerItem = MEPlayerItem(url: url, options: options)
         if options.videoDisable {

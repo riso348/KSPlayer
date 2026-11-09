@@ -70,6 +70,18 @@ public final class MetalPlayView: UIView, VideoOutput {
 
     private let metalView = MetalView()
     public weak var displayLayerDelegate: DisplayLayerDelegate?
+
+    // MARK: Passthrough (RMDB fork)
+
+    /// Layer the system decodes compressed Dolby Vision into, timed by
+    /// AudioRendererPlayer's synchronizer (no control timebase of its own).
+    private var passthroughView: AVSampleBufferDisplayView?
+    private weak var passthroughSynchronizer: AVSampleBufferRenderSynchronizer?
+    private let passthroughQueue = DispatchQueue(label: "ks.player.passthrough.video", qos: .userInteractive)
+    private var passthroughNeedsKeyFrame = false
+    private var passthroughRetryScheduled = false
+    private var passthroughCriteriaSent = false
+    public var passthroughLayer: AVSampleBufferDisplayLayer? { passthroughView?.displayLayer }
     public init(options: KSOptions) {
         self.options = options
         super.init(frame: .zero)
@@ -84,7 +96,8 @@ public final class MetalPlayView: UIView, VideoOutput {
     }
 
     public func play() {
-        displayLink.isPaused = false
+        // Passthrough: the synchronizer presents the frames, not the display link.
+        displayLink.isPaused = passthroughView != nil
     }
 
     public func pause() {
@@ -120,6 +133,7 @@ public final class MetalPlayView: UIView, VideoOutput {
             default:
                 break
             }
+            passthroughView?.displayLayer.videoGravity = displayView.displayLayer.videoGravity
         }
     }
 
@@ -143,6 +157,14 @@ public final class MetalPlayView: UIView, VideoOutput {
 
     public func flush() {
         pixelBuffer = nil
+        if let passthroughView {
+            let layer = passthroughView.displayLayer
+            passthroughQueue.async { [weak self] in
+                layer.flushAndRemoveImage()
+                self?.passthroughNeedsKeyFrame = true
+            }
+            return
+        }
         if displayView.isHidden {
             metalView.clear()
         } else {
@@ -151,11 +173,102 @@ public final class MetalPlayView: UIView, VideoOutput {
     }
 
     public func invalidate() {
+        disablePassthrough()
         displayLink.invalidate()
     }
 
     public func readNextFrame() {
         draw(force: true)
+    }
+
+    /// Switches this view to the passthrough layer: compressed frames are
+    /// pulled in decode order as fast as the layer takes them, and the
+    /// synchronizer (driven by the audio renderer) decides when each is shown.
+    public func enablePassthrough(synchronizer: AVSampleBufferRenderSynchronizer) {
+        guard passthroughView == nil else { return }
+        let view = AVSampleBufferDisplayView(frame: bounds, controlTimebase: false)
+        view.displayLayer.videoGravity = displayView.displayLayer.videoGravity
+        addSubview(view)
+        displayView.isHidden = true
+        metalView.isHidden = true
+        displayLink.isPaused = true
+        passthroughView = view
+        passthroughSynchronizer = synchronizer
+        passthroughNeedsKeyFrame = true
+        passthroughCriteriaSent = false
+        synchronizer.addRenderer(view.displayLayer)
+        displayLayerDelegate?.change(displayLayer: view.displayLayer)
+        let layer = view.displayLayer
+        layer.requestMediaDataWhenReady(on: passthroughQueue) { [weak self] in
+            self?.feedPassthrough(layer: layer)
+        }
+        KSLog("[passthrough] display layer attached to the audio synchronizer")
+    }
+
+    public func disablePassthrough() {
+        guard let passthroughView else { return }
+        let layer = passthroughView.displayLayer
+        layer.stopRequestingMediaData()
+        passthroughSynchronizer?.removeRenderer(layer, at: .zero, completionHandler: nil)
+        passthroughSynchronizer = nil
+        self.passthroughView = nil
+        runOnMainThread { [weak self] in
+            passthroughView.removeFromSuperview()
+            guard let self else { return }
+            // draw() picks Metal or the display layer again on the next frame.
+            self.metalView.isHidden = false
+            self.displayLayerDelegate?.change(displayLayer: self.displayView.displayLayer)
+        }
+    }
+
+    private func feedPassthrough(layer: AVSampleBufferDisplayLayer) {
+        guard passthroughView?.displayLayer === layer else { return }
+        while layer.isReadyForMoreMediaData {
+            if layer.status == .failed {
+                KSLog("[passthrough] display layer failed: \(String(describing: layer.error)) — flushing")
+                layer.flush()
+                passthroughNeedsKeyFrame = true
+            } else if #available(macOS 11.0, iOS 14, tvOS 14, *), layer.requiresFlushToResumeDecoding {
+                layer.flush()
+                passthroughNeedsKeyFrame = true
+            }
+            guard let frame = renderSource?.getVideoOutputRender(force: true) else {
+                // Nothing decoded yet. The layer doesn't call back while it
+                // stays ready, so look again shortly.
+                if !passthroughRetryScheduled {
+                    passthroughRetryScheduled = true
+                    passthroughQueue.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+                        self?.passthroughRetryScheduled = false
+                        self?.feedPassthrough(layer: layer)
+                    }
+                }
+                return
+            }
+            guard let sampleBuffer = frame.sampleBuffer else { continue }
+            if frame.isDiscontinuity {
+                // First frame after a seek: drop what the layer still holds.
+                layer.flush()
+                passthroughNeedsKeyFrame = false
+            } else if passthroughNeedsKeyFrame {
+                if sampleBuffer.isNotSync { continue }
+                passthroughNeedsKeyFrame = false
+            }
+            layer.enqueue(sampleBuffer)
+            let time = frame.cmtime
+            let position = frame.position
+            let fps = frame.fps
+            let sendCriteria = !passthroughCriteriaSent
+            passthroughCriteriaSent = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.renderSource?.setVideo(time: time, position: position)
+                if sendCriteria {
+                    // TV mode (Dolby Vision, frame rate) from the format
+                    // description the layer decodes, not from a pixel buffer.
+                    self.options.updateVideo(refreshRate: fps, isDovi: true, formatDescription: sampleBuffer.formatDescription)
+                }
+            }
+        }
     }
 
 //    deinit {
@@ -169,6 +282,11 @@ extension MetalPlayView {
     }
 
     private func draw(force: Bool) {
+        // Passthrough frames go to the layer in feedPassthrough; popping one
+        // here would lose a reference frame.
+        if options.isVideoPassthroughActive || passthroughView != nil {
+            return
+        }
         autoreleasepool {
             guard let frame = renderSource?.getVideoOutputRender(force: force) else {
                 return
@@ -311,11 +429,18 @@ class AVSampleBufferDisplayView: UIView {
         // swiftlint:enable force_cast
     }
 
-    override init(frame: CGRect) {
+    override convenience init(frame: CGRect) {
+        self.init(frame: frame, controlTimebase: true)
+    }
+
+    /// `controlTimebase: false` for a layer that joins an
+    /// AVSampleBufferRenderSynchronizer (which then owns its timebase).
+    init(frame: CGRect, controlTimebase useControlTimebase: Bool) {
         super.init(frame: frame)
         #if !canImport(UIKit)
         layer = AVSampleBufferDisplayLayer()
         #endif
+        guard useControlTimebase else { return }
         var controlTimebase: CMTimebase?
         CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &controlTimebase)
         if let controlTimebase {

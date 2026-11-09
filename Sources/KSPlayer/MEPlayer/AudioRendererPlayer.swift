@@ -38,8 +38,12 @@ public class AudioRendererPlayer: AudioOutput {
     public weak var renderSource: OutputRenderSourceDelegate?
     private var periodicTimeObserver: Any?
     private let renderer = AVSampleBufferAudioRenderer()
-    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    /// RMDB fork: public so the passthrough display layer can join it — then
+    /// the system keeps picture and sound in sync (and owns the clock).
+    public let synchronizer = AVSampleBufferRenderSynchronizer()
     private let serializationQueue = DispatchQueue(label: "ks.player.serialization.queue")
+    /// Frame `play()` had to read for its start time — enqueued first, not lost.
+    private var pendingRender: AudioFrame?
     var isPaused: Bool {
         synchronizer.rate == 0
     }
@@ -68,14 +72,16 @@ public class AudioRendererPlayer: AudioOutput {
             if renderer.hasSufficientMediaDataForReliablePlaybackStart {
                 time = synchronizer.currentTime()
             } else {
-                if let currentRender = renderSource?.getAudioOutputRender() {
+                if let currentRender = pendingRender ?? renderSource?.getAudioOutputRender() {
+                    pendingRender = currentRender
                     time = currentRender.cmtime
                 } else {
                     time = .zero
                 }
             }
         } else {
-            if let currentRender = renderSource?.getAudioOutputRender() {
+            if let currentRender = pendingRender ?? renderSource?.getAudioOutputRender() {
+                pendingRender = currentRender
                 time = currentRender.cmtime
             } else {
                 time = .zero
@@ -108,13 +114,33 @@ public class AudioRendererPlayer: AudioOutput {
     }
 
     public func flush() {
+        pendingRender = nil
         renderer.flush()
+    }
+
+    private func nextRender() -> AudioFrame? {
+        if let pendingRender {
+            self.pendingRender = nil
+            return pendingRender
+        }
+        return renderSource?.getAudioOutputRender()
     }
 
     private func request() {
         while renderer.isReadyForMoreMediaData, !isPaused {
-            guard var render = renderSource?.getAudioOutputRender() else {
+            guard var render = nextRender() else {
                 break
+            }
+            if let sampleBuffer = render.compressedSampleBuffer {
+                // Passthrough E-AC-3: one packet per buffer, no merging.
+                renderer.enqueue(sampleBuffer)
+                #if !os(macOS)
+                let channelCount = Int(render.audioFormat.channelCount)
+                if AVAudioSession.sharedInstance().preferredOutputNumberOfChannels != channelCount {
+                    try? AVAudioSession.sharedInstance().setPreferredOutputNumberOfChannels(channelCount)
+                }
+                #endif
+                continue
             }
             var array = [render]
             let loopCount = Int32(render.audioFormat.sampleRate) / 20 / Int32(render.numberOfSamples) - 2
