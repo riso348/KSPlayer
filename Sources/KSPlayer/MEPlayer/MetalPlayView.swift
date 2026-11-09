@@ -83,6 +83,13 @@ public final class MetalPlayView: UIView, VideoOutput {
     /// After a seek: frames still decoded from the old position are dropped
     /// until the first one from the new position (`isDiscontinuity`).
     private var passthroughAwaitingSeek = false
+    /// Decoded images are big (4K 10-bit ≈ 12 MB): the layer gets at most
+    /// this much ahead of the clock; the frame that would exceed it waits here.
+    private static let decodedLead = CMTime(value: 1, timescale: 2)
+    private var passthroughHeld: VideoVTBFrame?
+    /// Before playback starts the clock is not running: prefill this far
+    /// past the first image instead.
+    private var passthroughPrefillStart: CMTime?
     private var passthroughSeekStarted: CFTimeInterval = 0
     private var passthroughCriteriaSent = false
     public var passthroughLayer: AVSampleBufferDisplayLayer? { passthroughView?.displayLayer }
@@ -224,6 +231,8 @@ public final class MetalPlayView: UIView, VideoOutput {
             passthroughQueue.async { [weak self] in
                 layer.flushAndRemoveImage()
                 self?.passthroughNeedsKeyFrame = true
+                self?.passthroughHeld = nil
+                self?.passthroughPrefillStart = nil
             }
             return
         }
@@ -274,6 +283,8 @@ public final class MetalPlayView: UIView, VideoOutput {
         passthroughQueue.async { [weak self] in
             guard let self else { return }
             self.passthroughAwaitingSeek = true
+            self.passthroughHeld = nil
+            self.passthroughPrefillStart = nil
             self.passthroughSeekStarted = CACurrentMediaTime()
             self.passthroughNeedsKeyFrame = true
             layer.flush()
@@ -307,7 +318,9 @@ public final class MetalPlayView: UIView, VideoOutput {
                 layer.flush()
                 passthroughNeedsKeyFrame = true
             }
-            guard let frame = renderSource?.getVideoOutputRender(force: true) else {
+            let popped = passthroughHeld ?? renderSource?.getVideoOutputRender(force: true)
+            passthroughHeld = nil
+            guard let frame = popped else {
                 // Nothing decoded yet. The layer doesn't call back while it
                 // stays ready, so look again shortly.
                 if !passthroughRetryScheduled {
@@ -320,6 +333,27 @@ public final class MetalPlayView: UIView, VideoOutput {
                 return
             }
             guard let sampleBuffer = frame.sampleBuffer else { continue }
+            if frame.isDiscontinuity || passthroughAwaitingSeek {
+                passthroughPrefillStart = nil
+            }
+            if sampleBuffer.imageBuffer != nil, let synchronizer = passthroughSynchronizer, !passthroughAwaitingSeek || frame.isDiscontinuity {
+                // Decoded image: keep the layer at most `decodedLead` ahead.
+                let pts = sampleBuffer.presentationTimeStamp
+                let start = passthroughPrefillStart ?? pts
+                passthroughPrefillStart = start
+                let horizon = synchronizer.rate > 0 ? synchronizer.currentTime() + Self.decodedLead : start + Self.decodedLead
+                if pts > horizon, !frame.isDiscontinuity {
+                    passthroughHeld = frame
+                    if !passthroughRetryScheduled {
+                        passthroughRetryScheduled = true
+                        passthroughQueue.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                            self?.passthroughRetryScheduled = false
+                            self?.feedPassthrough(layer: layer)
+                        }
+                    }
+                    return
+                }
+            }
             if passthroughAwaitingSeek {
                 // Should the marker frame ever be missed, any key frame
                 // will do after 3 s.
@@ -350,6 +384,7 @@ public final class MetalPlayView: UIView, VideoOutput {
             let time = frame.cmtime
             let position = frame.position
             let fps = frame.fps
+            let criteria = frame.criteriaFormatDescription
             let sendCriteria = !passthroughCriteriaSent
             passthroughCriteriaSent = true
             DispatchQueue.main.async { [weak self] in
@@ -360,11 +395,12 @@ public final class MetalPlayView: UIView, VideoOutput {
                     // description the layer decodes, not from a pixel buffer.
                     // Dolby Vision unless the stream was reduced to its
                     // HDR10 base layer (profile 7 FEL, see KSOptions).
-                    let atoms = sampleBuffer.formatDescription.flatMap {
+                    let format = criteria ?? sampleBuffer.formatDescription
+                    let atoms = format.flatMap {
                         CMFormatDescriptionGetExtension($0, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? NSDictionary
                     }
                     let isDovi = atoms.map { $0["dvcC"] != nil || $0["dvvC"] != nil || $0["dvwC"] != nil } ?? true
-                    self.options.updateVideo(refreshRate: fps, isDovi: isDovi, formatDescription: sampleBuffer.formatDescription)
+                    self.options.updateVideo(refreshRate: fps, isDovi: isDovi, formatDescription: format)
                 }
             }
         }

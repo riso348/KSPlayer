@@ -438,6 +438,9 @@ public final class VideoVTBFrame: MEFrame {
     /// Passthrough: first frame after a seek / flush — the layer must be
     /// flushed before it is enqueued. Always a key frame.
     var isDiscontinuity = false
+    /// Passthrough, decoded ahead: the compressed stream's format description
+    /// (with its Dolby Vision box) — the TV mode follows it, not the image's.
+    var criteriaFormatDescription: CMFormatDescription?
     init(fps: Float, isDovi: Bool) {
         self.fps = fps
         self.isDovi = isDovi

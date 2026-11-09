@@ -117,6 +117,11 @@ open class KSOptions {
     /// first key frame's presentation (see PassthroughVideoDecode); 0 = no
     /// decode timestamps. Test knob while chasing dropped frames.
     public var dolbyVisionDecodeLead = 8
+    /// Native Dolby Vision: decode with our own VideoToolbox session ahead of
+    /// time and give the layer images (VideoToolbox attaches the RPU to each,
+    /// so Dolby Vision is kept). Compressed samples made the layer decode
+    /// just in time and drop ~20 % of 4K frames on Apple TV.
+    public var dolbyVisionDecodeAhead = true
     /// Codec type of the Dolby Vision format description handed to the layer.
     public var dolbyVisionCodecType: CMVideoCodecType = kCMVideoCodecType_DolbyVisionHEVC
     /// Set once the opened stream's video track actually goes through passthrough.

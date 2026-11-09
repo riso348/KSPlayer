@@ -17,6 +17,7 @@ import AVFoundation
 import CoreMedia
 import FFmpegKit
 import Libavcodec
+import VideoToolbox
 
 // MARK: - Video
 
@@ -38,6 +39,19 @@ final class PassthroughVideoDecode: DecodeProtocol {
     /// Frames per second as a fraction (num / den), when the stream says.
     private let frameRate: Timebase?
     private var lastDTS: CMTime?
+
+    // Decode-ahead (KSOptions.dolbyVisionDecodeAhead). Measured on Apple TV
+    // 4K with a UHD Blu-ray stream (layer lab, 2026-11-09): compressed
+    // samples → the layer drops 20 % of frames even as plain HEVC; decoded
+    // ahead by us → 0.7 %. VideoToolbox puts the RPU on each image
+    // (DolbyVisionRPUData, DolbyCompatibilityID), so Dolby Vision stays.
+    private var session: VTDecompressionSession?
+    private var sessionFormat: CMFormatDescription?
+    /// Decode order → presentation order: images wait here until enough
+    /// later ones are decoded that nothing can still come before them.
+    private var reorder = [VideoVTBFrame]()
+    private static let reorderDepth = 6
+    private var nextIsDiscontinuity = false
 
     init?(assetTrack: FFmpegAssetTrack, options: KSOptions) {
         guard let formatDescription = assetTrack.dolbyVisionFormatDescription(codecType: options.dolbyVisionCodecType) else {
@@ -175,6 +189,10 @@ final class PassthroughVideoDecode: DecodeProtocol {
         guard let sampleBuffer = made else {
             return
         }
+        if options.dolbyVisionDecodeAhead {
+            decodeAhead(sampleBuffer, pts: pts, packet: corePacket, isDiscontinuity: isDiscontinuity, completionHandler: completionHandler)
+            return
+        }
         if !isKeyFrame || corePacket.flags & AV_PKT_FLAG_DISCARD != 0 {
             if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) as? [NSMutableDictionary], let dic = attachments.first {
                 if !isKeyFrame {
@@ -199,11 +217,92 @@ final class PassthroughVideoDecode: DecodeProtocol {
 
     func doFlushCodec() {
         waitingForKeyFrame = true
+        reorder.removeAll()
+        if let session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
     }
 
-    func shutdown() {}
+    func shutdown() {
+        reorder.removeAll()
+        if let session {
+            VTDecompressionSessionInvalidate(session)
+        }
+        session = nil
+    }
 
     func decode() {}
+
+    // MARK: - Decode ahead
+
+    private func makeSession() -> VTDecompressionSession? {
+        if let session, sessionFormat === formatDescription {
+            return session
+        }
+        if let session {
+            VTDecompressionSessionInvalidate(session)
+        }
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+        ]
+        var created: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(allocator: nil, formatDescription: formatDescription, decoderSpecification: nil, imageBufferAttributes: attributes as CFDictionary, outputCallback: nil, decompressionSessionOut: &created)
+        if status != noErr {
+            KSLog("[passthrough] VideoToolbox session failed: \(status)")
+        }
+        session = created
+        sessionFormat = formatDescription
+        return created
+    }
+
+    private func decodeAhead(_ sampleBuffer: CMSampleBuffer, pts: Int64, packet: AVPacket, isDiscontinuity: Bool, completionHandler: @escaping (Result<MEFrame, Error>) -> Void) {
+        if isDiscontinuity {
+            reorder.removeAll()
+            nextIsDiscontinuity = true
+        }
+        guard let session = makeSession() else { return }
+        let isDovi = !(profile7?.baseLayerOnly ?? false)
+        let criteria = formatDescription
+        let timebase = assetTrack.timebase
+        var flags = VTDecodeInfoFlags()
+        // Synchronous: the image (or error) arrives before this returns, one per sample.
+        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sampleBuffer, flags: [], infoFlagsOut: &flags) { [weak self] status, _, imageBuffer, presentationTime, duration in
+            guard let self, status == noErr, let imageBuffer else { return }
+            var format: CMVideoFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: imageBuffer, formatDescriptionOut: &format)
+            guard let format else { return }
+            var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
+            var image: CMSampleBuffer?
+            CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: imageBuffer, formatDescription: format, sampleTiming: &timing, sampleBufferOut: &image)
+            guard let image else { return }
+            let frame = VideoVTBFrame(fps: self.assetTrack.nominalFrameRate, isDovi: isDovi)
+            frame.sampleBuffer = image
+            frame.criteriaFormatDescription = criteria
+            frame.timebase = timebase
+            frame.timestamp = pts
+            frame.duration = packet.duration
+            frame.position = packet.pos
+            frame.size = packet.size
+            self.reorder.append(frame)
+        }
+        if status != noErr {
+            KSLog("[passthrough] decode failed: \(status) — resuming at the next key frame")
+            waitingForKeyFrame = true
+            if status == kVTInvalidSessionErr {
+                VTDecompressionSessionInvalidate(session)
+                self.session = nil
+            }
+            return
+        }
+        reorder.sort { $0.timestamp < $1.timestamp }
+        while reorder.count > Self.reorderDepth {
+            let frame = reorder.removeFirst()
+            frame.isDiscontinuity = nextIsDiscontinuity
+            nextIsDiscontinuity = false
+            completionHandler(.success(frame))
+        }
+    }
 }
 
 extension CMSampleBuffer {
