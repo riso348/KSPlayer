@@ -18,6 +18,7 @@ use truehd::structs::oamd::{GAIN_MINUS_INFINITY, ObjectAudioMetadataPayload};
 use truehd::process::decode::{DecodedAccessUnit, Decoder};
 use truehd::process::extract::Extractor;
 use truehd::process::parse::Parser;
+use truehd::utils::errors::ExtractError;
 
 pub const THD_MAX_SAMPLES: usize = 160;
 pub const THD_MAX_ELEMENTS: usize = 16;
@@ -115,9 +116,14 @@ impl ThdDecoder {
     fn push(&mut self, data: &[u8]) {
         self.extractor.push_bytes(data);
         while let Some(frame) = self.extractor.next() {
-            let Ok(frame) = frame else {
-                self.errors += 1;
-                continue;
+            let frame = match frame {
+                Ok(frame) => frame,
+                // The packet's bytes are used up — not an error.
+                Err(ExtractError::InsufficientData) => break,
+                Err(_) => {
+                    self.errors += 1;
+                    continue;
+                }
             };
             if self.resyncing && !frame.is_major_sync() {
                 continue;

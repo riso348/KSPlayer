@@ -35,6 +35,8 @@ final class PassthroughVideoDecode: DecodeProtocol {
     private var reportedEnhancementLayer: DolbyVisionProfile7Converter.EnhancementLayer?
     /// Decode timestamps for the layer (see `decodeTimeStamp(pts:)`).
     private let frameDuration: CMTime
+    /// Frames per second as a fraction (num / den), when the stream says.
+    private let frameRate: Timebase?
     private var lastDTS: CMTime?
 
     init?(assetTrack: FFmpegAssetTrack, options: KSOptions) {
@@ -47,12 +49,37 @@ final class PassthroughVideoDecode: DecodeProtocol {
         profile7 = assetTrack.isDolbyVisionProfile7 ? DolbyVisionProfile7Converter() : nil
         nalLengthSize = assetTrack.nalLengthSize
         codecTag = options.dolbyVisionCodecType == kCMVideoCodecType_DolbyVisionHEVC ? "dvh1" : "hvc1"
-        let fps = assetTrack.nominalFrameRate > 1 ? Double(assetTrack.nominalFrameRate) : 24000.0 / 1001
-        frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 1_000_000_000)
+        // Exact frame rate (24000/1001, not 23.976) for the frame grid.
+        let rates = [assetTrack.realFrameRate, assetTrack.avgFrameRate].filter { rate in
+            guard rate.num > 0, rate.den > 0 else { return false }
+            let fps = Double(rate.num) / Double(rate.den)
+            return fps >= 10 && fps <= 121
+        }
+        frameRate = rates.first
+        if let rate = frameRate {
+            frameDuration = CMTime(value: CMTimeValue(rate.den), timescale: rate.num)
+        } else {
+            let fps = assetTrack.nominalFrameRate > 1 ? Double(assetTrack.nominalFrameRate) : 24000.0 / 1001
+            frameDuration = CMTime(seconds: 1 / fps, preferredTimescale: 1_000_000_000)
+        }
         if let dovi = assetTrack.dovi {
             let profile = profile7 != nil ? "P7.\(dovi.dv_bl_signal_compatibility_id) → 8.1" : "P\(dovi.dv_profile).\(dovi.dv_bl_signal_compatibility_id)"
             assetTrack.passthroughInfo = "Dolby Vision \(profile) · \(codecTag)"
         }
+    }
+
+    /// Matroska stores times in whole milliseconds: at 23.976 fps frames sit
+    /// 41 or 42 ms apart instead of 41.708. The layer shows each frame on the
+    /// first refresh after its time, so a time rounded across a refresh
+    /// boundary lands a refresh early or late — a repeated or skipped frame,
+    /// i.e. judder (the Metal path hid it by picking frames per refresh).
+    /// Snap times back onto the exact frame grid; only container rounding
+    /// (well under a quarter frame) is corrected, never a real offset.
+    private func onFrameGrid(_ time: CMTime) -> CMTime {
+        guard let rate = frameRate, time.isValid else { return time }
+        let frames = (time.seconds * Double(rate.num) / Double(rate.den)).rounded()
+        let snapped = CMTime(value: CMTimeValue(frames) * CMTimeValue(rate.den), timescale: rate.num)
+        return abs((snapped - time).seconds) < 0.25 * frameDuration.seconds ? snapped : time
     }
 
     /// Matroska has no DTS. FFmpeg guesses one from a window of PTS values
@@ -116,8 +143,8 @@ final class PassthroughVideoDecode: DecodeProtocol {
         if isDiscontinuity {
             lastDTS = nil
         }
-        let presentationTime = timebase.cmtime(for: pts)
-        let duration = corePacket.duration > 0 ? timebase.cmtime(for: corePacket.duration) : CMTime.invalid
+        let presentationTime = onFrameGrid(timebase.cmtime(for: pts))
+        let duration = frameRate != nil ? frameDuration : corePacket.duration > 0 ? timebase.cmtime(for: corePacket.duration) : CMTime.invalid
         var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: decodeTimeStamp(pts: presentationTime))
         let made: CMSampleBuffer?
         if let profile7 {
