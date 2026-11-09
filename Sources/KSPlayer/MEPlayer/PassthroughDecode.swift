@@ -25,6 +25,11 @@ final class PassthroughVideoDecode: DecodeProtocol {
     private let formatDescription: CMFormatDescription
     /// After a flush the layer can only resume from a key frame.
     private var waitingForKeyFrame = true
+    /// Profile 7 → 8.1, nil for single-layer profiles.
+    private let profile7: DolbyVisionProfile7Converter?
+    private let nalLengthSize: Int
+    private let codecTag: String
+    private var reportedEnhancementLayer: DolbyVisionProfile7Converter.EnhancementLayer?
 
     init?(assetTrack: FFmpegAssetTrack, options: KSOptions) {
         guard let formatDescription = assetTrack.dolbyVisionFormatDescription(codecType: options.dolbyVisionCodecType) else {
@@ -32,9 +37,24 @@ final class PassthroughVideoDecode: DecodeProtocol {
         }
         self.assetTrack = assetTrack
         self.formatDescription = formatDescription
+        profile7 = assetTrack.isDolbyVisionProfile7 ? DolbyVisionProfile7Converter() : nil
+        nalLengthSize = assetTrack.nalLengthSize
+        codecTag = options.dolbyVisionCodecType == kCMVideoCodecType_DolbyVisionHEVC ? "dvh1" : "hvc1"
         if let dovi = assetTrack.dovi {
-            let tag = options.dolbyVisionCodecType == kCMVideoCodecType_DolbyVisionHEVC ? "dvh1" : "hvc1"
-            assetTrack.passthroughInfo = "Dolby Vision P\(dovi.dv_profile).\(dovi.dv_bl_signal_compatibility_id) · \(tag)"
+            let profile = profile7 != nil ? "P7.\(dovi.dv_bl_signal_compatibility_id) → 8.1" : "P\(dovi.dv_profile).\(dovi.dv_bl_signal_compatibility_id)"
+            assetTrack.passthroughInfo = "Dolby Vision \(profile) · \(codecTag)"
+        }
+    }
+
+    /// The diagnostics line learns MEL / FEL from the first converted RPU.
+    private func reportProfile7() {
+        guard let profile7, let layer = profile7.enhancementLayer, layer != reportedEnhancementLayer else { return }
+        reportedEnhancementLayer = layer
+        let info = "Dolby Vision P7 \(layer.rawValue) → 8.1 · \(codecTag)"
+        KSLog("[passthrough] \(info), RPUs converted \(profile7.convertedCount), kept \(profile7.failedCount)")
+        let assetTrack = assetTrack
+        DispatchQueue.main.async {
+            assetTrack.passthroughInfo = info
         }
     }
 
@@ -57,7 +77,22 @@ final class PassthroughVideoDecode: DecodeProtocol {
         let dts = corePacket.dts != Int64.min ? timebase.cmtime(for: corePacket.dts) : CMTime.invalid
         let duration = corePacket.duration > 0 ? timebase.cmtime(for: corePacket.duration) : CMTime.invalid
         var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: timebase.cmtime(for: pts), decodeTimeStamp: dts)
-        guard let sampleBuffer = makeCompressedSampleBuffer(data: data, size: Int(corePacket.size), formatDescription: formatDescription, timing: &timing) else {
+        let made: CMSampleBuffer?
+        if let profile7 {
+            guard var converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize) else {
+                KSLog("[passthrough] malformed profile 7 sample at pts \(pts), dropped")
+                // Later frames may reference it: resume at the next key frame.
+                waitingForKeyFrame = true
+                return
+            }
+            made = converted.withUnsafeMutableBufferPointer {
+                makeCompressedSampleBuffer(data: $0.baseAddress!, size: $0.count, formatDescription: formatDescription, timing: &timing)
+            }
+            reportProfile7()
+        } else {
+            made = makeCompressedSampleBuffer(data: data, size: Int(corePacket.size), formatDescription: formatDescription, timing: &timing)
+        }
+        guard let sampleBuffer = made else {
             return
         }
         if !isKeyFrame || corePacket.flags & AV_PKT_FLAG_DISCARD != 0 {

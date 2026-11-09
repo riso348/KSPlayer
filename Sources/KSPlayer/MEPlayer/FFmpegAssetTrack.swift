@@ -296,7 +296,22 @@ extension FFmpegAssetTrack {
         guard mediaType == .video, codecpar.codec_id == AV_CODEC_ID_HEVC, !isConvertNALSize,
               formatDescription != nil, let dovi
         else { return false }
-        return dovi.dv_profile == 5 || dovi.dv_profile == 8
+        // Profile 7 (UHD Blu-ray) plays as 8.1, see DolbyVisionProfile7Converter.
+        return dovi.dv_profile == 5 || dovi.dv_profile == 7 || dovi.dv_profile == 8
+    }
+
+    /// Dual-layer profile 7: the enhancement layer is dropped and the RPU
+    /// rewritten, so the layer is given a profile 8.1 stream.
+    var isDolbyVisionProfile7: Bool {
+        dovi?.dv_profile == 7
+    }
+
+    /// Bytes in each NAL unit length prefix (hvcC lengthSizeMinusOne + 1).
+    var nalLengthSize: Int {
+        guard let extradata = codecpar.extradata, codecpar.extradata_size > 22, extradata[0] == 1 else {
+            return 4
+        }
+        return Int(extradata[21] & 0x03) + 1
     }
 
     /// The track's HEVC format description plus the Dolby Vision
@@ -307,13 +322,17 @@ extension FFmpegAssetTrack {
         let extensions = (CMFormatDescriptionGetExtensions(formatDescription) as NSDictionary?)?.mutableCopy() as? NSMutableDictionary ?? NSMutableDictionary()
         let atomsKey = kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms as String
         let atoms = (extensions[atomsKey] as? NSDictionary)?.mutableCopy() as? NSMutableDictionary ?? NSMutableDictionary()
+        // Profile 7 is converted to 8.1: no enhancement layer, HDR10 base.
+        let profile = dovi.dv_profile == 7 ? 8 : dovi.dv_profile
+        let elPresent = dovi.dv_profile == 7 ? 0 : dovi.el_present_flag
+        let compatibility = dovi.dv_profile == 7 ? 1 : dovi.dv_bl_signal_compatibility_id
         var box = [UInt8](repeating: 0, count: 24)
         box[0] = dovi.dv_version_major
         box[1] = dovi.dv_version_minor
-        box[2] = (dovi.dv_profile & 0x7F) << 1 | (dovi.dv_level >> 5) & 0x01
-        box[3] = (dovi.dv_level & 0x1F) << 3 | (dovi.rpu_present_flag & 1) << 2 | (dovi.el_present_flag & 1) << 1 | (dovi.bl_present_flag & 1)
-        box[4] = (dovi.dv_bl_signal_compatibility_id & 0x0F) << 4
-        let boxName = dovi.dv_profile > 10 ? "dvwC" : dovi.dv_profile > 7 ? "dvvC" : "dvcC"
+        box[2] = (profile & 0x7F) << 1 | (dovi.dv_level >> 5) & 0x01
+        box[3] = (dovi.dv_level & 0x1F) << 3 | (dovi.rpu_present_flag & 1) << 2 | (elPresent & 1) << 1 | (dovi.bl_present_flag & 1)
+        box[4] = (compatibility & 0x0F) << 4
+        let boxName = profile > 10 ? "dvwC" : profile > 7 ? "dvvC" : "dvcC"
         atoms[boxName] = Data(box)
         extensions[atomsKey] = atoms
         // Decoder hints for our own VideoToolbox session — not for the layer.
