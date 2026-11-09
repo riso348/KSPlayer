@@ -113,6 +113,10 @@ open class KSOptions {
     /// base + enhancement, so the picture can come out worse than the plain
     /// HDR10 base layer. true = play FEL titles as HDR10; MEL is unaffected.
     public var dolbyVisionFELAsHDR10 = true
+    /// Native passthrough: decode timestamps this many frames before the
+    /// first key frame's presentation (see PassthroughVideoDecode); 0 = no
+    /// decode timestamps. Test knob while chasing dropped frames.
+    public var dolbyVisionDecodeLead = 8
     /// Codec type of the Dolby Vision format description handed to the layer.
     public var dolbyVisionCodecType: CMVideoCodecType = kCMVideoCodecType_DolbyVisionHEVC
     /// Set once the opened stream's video track actually goes through passthrough.

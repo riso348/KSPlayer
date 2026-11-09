@@ -93,7 +93,7 @@ final class PassthroughVideoDecode: DecodeProtocol {
     /// monotonic and stays below every PTS as long as frames are reordered
     /// by fewer than `lead` positions (UHD Blu-ray: ≤ 3).
     private func decodeTimeStamp(pts: CMTime) -> CMTime {
-        let lead: Int32 = 8
+        let lead = Int32(options.dolbyVisionDecodeLead)
         let tick = CMTime(value: 1, timescale: 1_000_000_000)
         var dts: CMTime
         if let lastDTS {
@@ -145,7 +145,8 @@ final class PassthroughVideoDecode: DecodeProtocol {
         }
         let presentationTime = onFrameGrid(timebase.cmtime(for: pts))
         let duration = frameRate != nil ? frameDuration : corePacket.duration > 0 ? timebase.cmtime(for: corePacket.duration) : CMTime.invalid
-        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: decodeTimeStamp(pts: presentationTime))
+        let decodeTime = options.dolbyVisionDecodeLead > 0 ? decodeTimeStamp(pts: presentationTime) : CMTime.invalid
+        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: presentationTime, decodeTimeStamp: decodeTime)
         let made: CMSampleBuffer?
         if let profile7 {
             var converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize)
