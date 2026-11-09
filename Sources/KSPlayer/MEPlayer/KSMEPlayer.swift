@@ -364,6 +364,10 @@ extension KSMEPlayer: MediaPlayerProtocol {
     public func seek(time: TimeInterval, completion: @escaping ((Bool) -> Void)) {
         let time = max(time, 0)
         playbackState = .seeking
+        // Native passthrough: the layer queues seconds ahead and must be
+        // emptied, or a backward seek leaves it full of frames from the old
+        // position that it won't show for minutes (and so takes no new ones).
+        (videoOutput as? MetalPlayView)?.passthroughSeek()
         runOnMainThread { [weak self] in
             self?.bufferingProgress = 0
         }

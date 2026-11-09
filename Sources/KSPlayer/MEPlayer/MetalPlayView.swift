@@ -80,6 +80,10 @@ public final class MetalPlayView: UIView, VideoOutput {
     private let passthroughQueue = DispatchQueue(label: "ks.player.passthrough.video", qos: .userInteractive)
     private var passthroughNeedsKeyFrame = false
     private var passthroughRetryScheduled = false
+    /// After a seek: frames still decoded from the old position are dropped
+    /// until the first one from the new position (`isDiscontinuity`).
+    private var passthroughAwaitingSeek = false
+    private var passthroughSeekStarted: CFTimeInterval = 0
     private var passthroughCriteriaSent = false
     public var passthroughLayer: AVSampleBufferDisplayLayer? { passthroughView?.displayLayer }
 
@@ -95,6 +99,41 @@ public final class MetalPlayView: UIView, VideoOutput {
 
     private let passthroughStatsLock = NSLock()
     private var passthroughStats = PassthroughFeedStats()
+
+    /// What the layer itself reports about showing frames (cumulative).
+    public struct PassthroughDisplayMetrics {
+        public var frames = 0
+        public var dropped = 0
+        public var corrupted = 0
+        /// Shown on the direct-to-display path (no compositing pass).
+        public var optimized = 0
+        public var delay: TimeInterval = 0
+    }
+
+    /// Latest metrics; `refreshPassthroughDisplayMetrics()` updates them.
+    public private(set) var passthroughDisplayMetrics: PassthroughDisplayMetrics?
+
+    public func refreshPassthroughDisplayMetrics() {
+        guard let layer = passthroughView?.displayLayer else {
+            passthroughDisplayMetrics = nil
+            return
+        }
+        if #available(tvOS 17.4, iOS 17.4, macOS 14.4, *) {
+            layer.sampleBufferRenderer.loadVideoPerformanceMetrics { [weak self] metrics in
+                guard let metrics else { return }
+                let value = PassthroughDisplayMetrics(
+                    frames: metrics.totalNumberOfFrames,
+                    dropped: metrics.numberOfDroppedFrames,
+                    corrupted: metrics.numberOfCorruptedFrames,
+                    optimized: metrics.numberOfFramesDisplayedUsingOptimizedCompositing,
+                    delay: metrics.totalAccumulatedFrameDelay
+                )
+                DispatchQueue.main.async {
+                    self?.passthroughDisplayMetrics = value
+                }
+            }
+        }
+    }
 
     /// Stats since the last call.
     public func readPassthroughStats() -> PassthroughFeedStats {
@@ -228,6 +267,19 @@ public final class MetalPlayView: UIView, VideoOutput {
         KSLog("[passthrough] display layer attached to the audio synchronizer")
     }
 
+    /// Seek started: empty the layer and drop old frames (see KSMEPlayer.seek).
+    public func passthroughSeek() {
+        guard let passthroughView else { return }
+        let layer = passthroughView.displayLayer
+        passthroughQueue.async { [weak self] in
+            guard let self else { return }
+            self.passthroughAwaitingSeek = true
+            self.passthroughSeekStarted = CACurrentMediaTime()
+            self.passthroughNeedsKeyFrame = true
+            layer.flush()
+        }
+    }
+
     public func disablePassthrough() {
         guard let passthroughView else { return }
         let layer = passthroughView.displayLayer
@@ -268,6 +320,15 @@ public final class MetalPlayView: UIView, VideoOutput {
                 return
             }
             guard let sampleBuffer = frame.sampleBuffer else { continue }
+            if passthroughAwaitingSeek {
+                // Should the marker frame ever be missed, any key frame
+                // will do after 3 s.
+                let timedOut = CACurrentMediaTime() - passthroughSeekStarted > 3
+                guard frame.isDiscontinuity || (timedOut && !sampleBuffer.isNotSync) else {
+                    continue
+                }
+                passthroughAwaitingSeek = false
+            }
             if frame.isDiscontinuity {
                 // First frame after a seek: drop what the layer still holds.
                 layer.flush()
