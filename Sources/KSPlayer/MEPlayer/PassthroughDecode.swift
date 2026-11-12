@@ -25,8 +25,14 @@ final class PassthroughVideoDecode: DecodeProtocol {
     private let assetTrack: FFmpegAssetTrack
     private let options: KSOptions
     private var formatDescription: CMFormatDescription
-    /// Profile 7: FEL / MEL is known from the first RPU; decided once.
+    private let dolbyVisionFormat: CMFormatDescription
+    /// HDR10 base layer of profile 7 / 8.1, nil when there is none.
+    private let hdr10Format: CMFormatDescription?
+    /// Profile 7: FEL / MEL is known from the first RPU.
     private var profile7Decided = false
+    /// Profile 8.1 as HDR10: drops the RPU (nil for profile 7, which has its own).
+    private let rpuStripper: DolbyVisionProfile7Converter?
+    private var baseLayerOnly = false
     /// After a flush the layer can only resume from a key frame.
     private var waitingForKeyFrame = true
     /// Profile 7 → 8.1, nil for single-layer profiles.
@@ -60,7 +66,18 @@ final class PassthroughVideoDecode: DecodeProtocol {
         self.assetTrack = assetTrack
         self.options = options
         self.formatDescription = formatDescription
+        dolbyVisionFormat = formatDescription
         profile7 = assetTrack.isDolbyVisionProfile7 ? DolbyVisionProfile7Converter() : nil
+        let hasHDR10Base = profile7 != nil || assetTrack.dovi?.dv_bl_signal_compatibility_id == 1
+        hdr10Format = hasHDR10Base ? assetTrack.hdr10FormatDescription() : nil
+        if profile7 == nil, hdr10Format != nil {
+            let stripper = DolbyVisionProfile7Converter()
+            stripper.baseLayerOnly = true
+            rpuStripper = stripper
+        } else {
+            rpuStripper = nil
+        }
+        options.isDolbyVisionBaseLayerOnly = false
         nalLengthSize = assetTrack.nalLengthSize
         codecTag = options.dolbyVisionCodecType == kCMVideoCodecType_DolbyVisionHEVC ? "dvh1" : "hvc1"
         // Exact frame rate (24000/1001, not 23.976) for the frame grid.
@@ -126,14 +143,36 @@ final class PassthroughVideoDecode: DecodeProtocol {
         return dts
     }
 
+    /// HDR10 base layer or Dolby Vision, per `KSOptions.dolbyVisionAsHDR10`
+    /// (automatic: profile 7 FEL as HDR10 if `dolbyVisionFELAsHDR10`).
+    /// Only at a key frame after a flush: the format changes for the layer.
+    private func chooseOutput() {
+        guard let hdr10Format else { return }
+        let fel = profile7?.enhancementLayer == .fel
+        let wanted = options.dolbyVisionAsHDR10 ?? (fel && options.dolbyVisionFELAsHDR10)
+        guard wanted != baseLayerOnly else { return }
+        baseLayerOnly = wanted
+        profile7?.baseLayerOnly = wanted
+        formatDescription = wanted ? hdr10Format : dolbyVisionFormat
+        options.isDolbyVisionBaseLayerOnly = wanted
+        reportedEnhancementLayer = nil
+        if profile7 == nil {
+            reportOutput(wanted ? "Dolby Vision P8.1 → HDR10 base layer · hvc1" : "Dolby Vision P8.1 · \(codecTag)")
+        }
+    }
+
     /// The diagnostics line learns MEL / FEL from the first converted RPU.
     private func reportProfile7() {
         guard let profile7, let layer = profile7.enhancementLayer, layer != reportedEnhancementLayer else { return }
         reportedEnhancementLayer = layer
         let info = profile7.baseLayerOnly
-            ? "Dolby Vision P7 FEL → HDR10 base layer · hvc1"
+            ? "Dolby Vision P7 \(layer.rawValue) → HDR10 base layer · hvc1"
             : "Dolby Vision P7 \(layer.rawValue) → 8.1 · \(codecTag)"
         KSLog("[passthrough] \(info), RPUs converted \(profile7.convertedCount), kept \(profile7.failedCount)")
+        reportOutput(info)
+    }
+
+    private func reportOutput(_ info: String) {
         let assetTrack = assetTrack
         DispatchQueue.main.async {
             assetTrack.passthroughInfo = info
@@ -156,6 +195,9 @@ final class PassthroughVideoDecode: DecodeProtocol {
         guard pts != Int64.min else { return }
         if isDiscontinuity {
             lastDTS = nil
+            if profile7 == nil || profile7Decided {
+                chooseOutput()
+            }
         }
         let presentationTime = onFrameGrid(timebase.cmtime(for: pts))
         let duration = frameRate != nil ? frameDuration : corePacket.duration > 0 ? timebase.cmtime(for: corePacket.duration) : CMTime.invalid
@@ -164,12 +206,11 @@ final class PassthroughVideoDecode: DecodeProtocol {
         let made: CMSampleBuffer?
         if let profile7 {
             var converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize)
-            if !profile7Decided, let layer = profile7.enhancementLayer {
+            if !profile7Decided, profile7.enhancementLayer != nil {
                 profile7Decided = true
-                // Before the first sample reaches the layer: FEL as HDR10.
-                if layer == .fel, options.dolbyVisionFELAsHDR10, let hdr10 = assetTrack.hdr10FormatDescription() {
-                    profile7.baseLayerOnly = true
-                    formatDescription = hdr10
+                // Before the first sample reaches the layer (FEL / MEL is known now).
+                chooseOutput()
+                if profile7.baseLayerOnly {
                     converted = profile7.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize)
                 }
             }
@@ -183,6 +224,14 @@ final class PassthroughVideoDecode: DecodeProtocol {
                 makeCompressedSampleBuffer(data: $0.baseAddress!, size: $0.count, formatDescription: formatDescription, timing: &timing)
             }
             reportProfile7()
+        } else if baseLayerOnly, let rpuStripper {
+            guard var stripped = rpuStripper.convertSample(data, size: Int(corePacket.size), nalLengthSize: nalLengthSize) else {
+                waitingForKeyFrame = true
+                return
+            }
+            made = stripped.withUnsafeMutableBufferPointer {
+                makeCompressedSampleBuffer(data: $0.baseAddress!, size: $0.count, formatDescription: formatDescription, timing: &timing)
+            }
         } else {
             made = makeCompressedSampleBuffer(data: data, size: Int(corePacket.size), formatDescription: formatDescription, timing: &timing)
         }
@@ -204,7 +253,7 @@ final class PassthroughVideoDecode: DecodeProtocol {
                 }
             }
         }
-        let frame = VideoVTBFrame(fps: assetTrack.nominalFrameRate, isDovi: true)
+        let frame = VideoVTBFrame(fps: assetTrack.nominalFrameRate, isDovi: !baseLayerOnly)
         frame.sampleBuffer = sampleBuffer
         frame.isDiscontinuity = isDiscontinuity
         frame.timebase = timebase
@@ -262,7 +311,7 @@ final class PassthroughVideoDecode: DecodeProtocol {
             nextIsDiscontinuity = true
         }
         guard let session = makeSession() else { return }
-        let isDovi = !(profile7?.baseLayerOnly ?? false)
+        let isDovi = !baseLayerOnly
         let criteria = formatDescription
         let timebase = assetTrack.timebase
         var flags = VTDecodeInfoFlags()

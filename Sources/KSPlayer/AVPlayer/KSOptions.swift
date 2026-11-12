@@ -112,7 +112,14 @@ open class KSOptions {
     /// conversion drops the enhancement layer, and the RPU was graded for
     /// base + enhancement, so the picture can come out worse than the plain
     /// HDR10 base layer. true = play FEL titles as HDR10; MEL is unaffected.
-    public var dolbyVisionFELAsHDR10 = true
+    public var dolbyVisionFELAsHDR10 = false
+    /// Native Dolby Vision, picked by the viewer: true = HDR10 base layer
+    /// (RPU dropped), false = Dolby Vision, nil = automatic (FEL rule above).
+    /// Profile 7 and 8.1 only (HDR10 base). Applied at the next key frame
+    /// after a flush — seek to the current position after changing it.
+    public var dolbyVisionAsHDR10: Bool?
+    /// Native Dolby Vision currently plays its HDR10 base layer.
+    public internal(set) var isDolbyVisionBaseLayerOnly = false
     /// Native passthrough: decode timestamps this many frames before the
     /// first key frame's presentation (see PassthroughVideoDecode); 0 = no
     /// decode timestamps. Test knob while chasing dropped frames.

@@ -91,7 +91,8 @@ public final class MetalPlayView: UIView, VideoOutput {
     /// past the first image instead.
     private var passthroughPrefillStart: CMTime?
     private var passthroughSeekStarted: CFTimeInterval = 0
-    private var passthroughCriteriaSent = false
+    /// Dolby Vision flag of the display criteria last sent (nil = none yet).
+    private var passthroughCriteriaDovi: Bool?
     public var passthroughLayer: AVSampleBufferDisplayLayer? { passthroughView?.displayLayer }
 
     /// Passthrough feed health for diagnostics: how far ahead of the
@@ -266,7 +267,7 @@ public final class MetalPlayView: UIView, VideoOutput {
         passthroughView = view
         passthroughSynchronizer = synchronizer
         passthroughNeedsKeyFrame = true
-        passthroughCriteriaSent = false
+        passthroughCriteriaDovi = nil
         synchronizer.addRenderer(view.displayLayer)
         displayLayerDelegate?.change(displayLayer: view.displayLayer)
         let layer = view.displayLayer
@@ -391,8 +392,10 @@ public final class MetalPlayView: UIView, VideoOutput {
             let position = frame.position
             let fps = frame.fps
             let criteria = frame.criteriaFormatDescription
-            let sendCriteria = !passthroughCriteriaSent
-            passthroughCriteriaSent = true
+            // Again when the picture switches between Dolby Vision and its
+            // HDR10 base layer (KSOptions.dolbyVisionAsHDR10).
+            let sendCriteria = passthroughCriteriaDovi != frame.isDovi
+            passthroughCriteriaDovi = frame.isDovi
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.renderSource?.setVideo(time: time, position: position)
